@@ -3242,6 +3242,7 @@ THROW_TESTS = {
     "stand_put": dict(ids=("sp_fwd_stand", "sp_stand"), label="Толчок ядра с места, м", event="SP", impl=7.26),
     "stand_dt": dict(ids=("ts_dt_stand", "dt_stand_full", "dt_stand"), label="Бросок диска с места, м", event="DT", impl=2.0),
 }
+EXTRA_TESTS = {"snatch": dict(ids=("st_snatch",), label="Рывок штанги, кг")}       # тест без таблицы Нариманова: только групповые средние Грузенкина
 GRZ_TEST_DYN = {"shot_bwd": (15.18, 15.99), "triple_sj": (9.07, 9.45), "bench": (106.8, 119.6), "fly30": (3.16, 3.06), "snatch": (80.3, 87.2)}
 WEAK_GAP = 500.0       # МОЁ: на сколько очков уровень теста должен отличаться от уровня результата, чтобы считать разницу значимой
 
@@ -3261,11 +3262,15 @@ def tests_from_journal(log: Sequence[dict], today=None, window_days: int = 120) 
             continue
         for it in (e.get("items") or []):
             iid = it.get("id")
-            for tk, sp in {**SFP_TESTS, **THROW_TESTS}.items():
+            for tk, sp in {**SFP_TESTS, **THROW_TESTS, **EXTRA_TESTS}.items():
                 if iid not in sp["ids"]:
                     continue
                 vals = [float(v) for v in (it.get("res") or []) if v is not None]
-                if tk in THROW_TESTS:
+                if tk == "snatch":                     # рывок: берём вес на ≤ 3 повторениях как оценку максимума (формула Эпли для рывка ненадёжна)
+                    if not it.get("size") or float(it["size"]) <= 0 or float(it.get("reps") or 1) > 3 or not (30.0 <= float(it["size"]) <= 200.0):
+                        continue
+                    v, better = float(it["size"]), (lambda a, b: a > b)
+                elif tk in THROW_TESTS:
                     w = it.get("impl")
                     if w is not None and abs(float(w) - sp["impl"]) > 0.25:
                         continue
@@ -3493,6 +3498,261 @@ def test_targets(tests: Dict[str, float], today, prep_start, prep_end, dates: Se
             f = float(np.clip((d - t0).days / max((t1 - t0).days, 1), 0.0, 1.0))
             rows.append(dict(test=tk, label=SFP_TESTS[tk]["label"], date=str(d.date()), target=float(tests[tk]) * (1.0 + p * f), now=float(tests[tk])))
     return pd.DataFrame(rows, columns=["test", "label", "date", "target", "now"])
+
+
+# ═════════════════════════════ 9j. «ЧТО ЕСЛИ»: профиль силы и прыжков → результаты видов и сумма очков ═════════════════════════════
+# Откуда что (это же показано в приложении).
+#  • ИЗ ИСТОЧНИКОВ: (а) Нариманов — какое значение теста соответствует какой сумме очков (таблица по уровням 4000…9000, срез по многим спортсменам: bench, triple_sj, shot_bwd, t1000);
+#    (б) Грузенкин — групповые средние тестов в двух точках (до эксперимента 7647,5 очк. и лучшие за период 7859,0), в том числе рывок и бег 30 м с хода, которых у Нариманова нет;
+#    его же отношения «результат вида / тест» (ядро назад, толчок с места, диск с места); (в) связи между видами — синтез трёх таблиц корреляций (synth_corr).
+#  • МОЁ: (1) профиль «7500» (REF_PROFILE) как способ перевести «уровень» в результат вида; (2) линия Грузенкина как «значение теста → уровень» — это динамика ОДНОЙ группы за сезон,
+#    а не срез по спортсменам, поэтому вне диапазона группы (для рывка 82,6…87,6 кг) это экстраполяция; (3) веса: у теста «свой» вид — 1, у побочных видов и рывка — 0,5;
+#    (4) уровень нетестируемых видов = средний уровень протестированных + поправка по корреляциям при равном разбросе очков видов; (5) ширина коридора.
+#  • ЧЕГО НЕТ: индивидуальной регрессии «рывок → результат». У Грузенкина тесты приведены только средними по группе (6–8 человек), у Рудских в таблице силовых тестов нет, у Нариманова нет рывка и приседа.
+GRZ_SUM = (float(np.mean([a for a, _ in GRZ_T4["sum"]])), float(np.mean([b for _, b in GRZ_T4["sum"]])))        # 7647,5 → 7859,0 (табл. 4/5 Грузенкина)
+_REF_PTS = {e: float(wa_points(e, REF_PROFILE[e])) for e in EVENTS}
+PROFILE_TESTS = {
+    "snatch": dict(label="Рывок штанги, кг", short="рывок", grz="snatch_kg", scale=1.0, nar=None, ev=(("SP", .5), ("DT", .5), ("JT", .5)), step=5.0, rng=(30.0, 160.0)),
+    "bench": dict(label="Жим лёжа (1ПМ), кг", short="жим", grz="bench_kg", scale=1.0, nar="bench", ev=(("SP", .5), ("JT", .5)), step=5.0, rng=(30.0, 220.0)),
+    "triple_sj": dict(label="Тройной с места, м", short="тройной", grz="triple_cm", scale=.01, nar="triple_sj", ev=(("LJ", 1.0),), step=0.10, rng=(5.0, 11.5)),
+    "shot_bwd": dict(label="Ядро назад 7,26 кг, м", short="ядро назад", grz="bwd_cm", scale=.01, nar="shot_bwd", ev=(("SP", 1.0), ("DT", .5), ("JT", .5)), pair={"SP": "SP_bwd"},
+                     step=0.5, rng=(5.0, 22.0)),
+    "stand_put": dict(label="Толчок ядра с места, м", short="толчок с места", grz="stand_put_cm", scale=.01, nar=None, ev=(("SP", 1.0),), pair={"SP": "SP_stand"}, step=0.5, rng=(5.0, 20.0)),
+    "stand_dt": dict(label="Бросок диска с места 2 кг, м", short="диск с места", grz="stand_dt_cm", scale=.01, nar=None, ev=(("DT", 1.0),), pair={"DT": "DT_stand"}, step=2.0, rng=(15.0, 65.0)),
+    "fly30": dict(label="Бег 30 м с хода, с", short="30 м с хода", grz="fly30_s", scale=1.0, nar=None, ev=(("100m", 1.0), ("110mH", .5), ("LJ", .5)), step=-0.05, rng=(2.4, 4.5)),
+    "t1000": dict(label="Бег 1000 м, с", short="1000 м", grz=None, scale=1.0, nar="t1000", ev=(("1500m", 1.0),), step=-5.0, rng=(120.0, 400.0)),
+}
+LEVEL_CLIP = (5000.0, 9500.0)
+
+
+def _nar_group_errors() -> List[float]:
+    """Ошибки «уровень по Нариманову − сумма очков группы Грузенкина» (жим, ядро назад, тройной; до и после): независимая проверка таблицы Нариманова."""
+    errs = []
+    for idx, S in ((0, GRZ_SUM[0]), (3, GRZ_SUM[1])):
+        for nk, gk, sc in (("bench", "bench_kg", 1.0), ("shot_bwd", "bwd_cm", .01), ("triple_sj", "triple_cm", .01)):
+            errs.append(nar_level(nk, GRZ_T1[gk][idx] * sc) - S)
+    return errs
+
+
+def _pooled_event_sd() -> float:
+    """Разброс очков вида между спортсменами внутри группы мастеров: среднеквадратичное по ядру, диску, копью, длине (шесть человек, до и после; табл. 4 Грузенкина)."""
+    v = []
+    for ev in ("SP", "DT", "JT", "LJ_cm"):
+        for k in (0, 1):
+            e_ = "LJ" if ev == "LJ_cm" else ev
+            p = [float(wa_points(e_, a[k] / (100.0 if ev == "LJ_cm" else 1.0))) for a in GRZ_T4[ev]]
+            v.append(float(np.var(p, ddof=1)))
+    return float(np.sqrt(np.mean(v)))
+
+
+WHATIF_SIG_L = float(np.sqrt(np.mean(np.square(_nar_group_errors()))))      # ≈ 450 очков суммы: насколько один тест по Нариманову «промахивается» мимо уровня группы
+WHATIF_SIG_E = _pooled_event_sd()                                            # ≈ 64 очка вида
+
+
+def profile_levels(tk: str, v: float, sources: Sequence[str] = ("nar", "grz")) -> Dict[str, Tuple[float, bool]]:
+    """Значение теста → «уровень» (сумма очков) по каждому источнику: {источник: (уровень, вне диапазона источника)}.
+    nar — линейная интерполяция таблицы Нариманова; grz — прямая через две точки группы Грузенкина (7647,5 при «лучшем до», 7859,0 при «лучшем за период»)."""
+    sp = PROFILE_TESTS[tk]
+    out: Dict[str, Tuple[float, bool]] = {}
+    if sp["nar"] and "nar" in sources:
+        arr = NAR[sp["nar"]][0]
+        out["nar"] = (nar_level(sp["nar"], v), not (min(arr) <= v <= max(arr)))
+    if sp["grz"] and "grz" in sources:
+        row = np.array(GRZ_T1[sp["grz"]], float) * sp["scale"]
+        a, b = float(row[0]), float(row[3])
+        L = GRZ_SUM[0] + (v - a) / (b - a) * (GRZ_SUM[1] - GRZ_SUM[0])
+        out["grz"] = (float(np.clip(L, *LEVEL_CLIP)), not (float(row.min()) <= v <= float(row.max())))
+    return out
+
+
+def _pts_at(e: str, level: float) -> float:
+    return max(_REF_PTS[e] * float(level) / 7500.0, 30.0)
+
+
+def profile_whatif(tests: Dict[str, float], current: Optional[Dict[str, float]] = None, loss: float = 295.0, sources: Sequence[str] = ("nar", "grz")) -> dict:
+    """Ожидаемые результаты видов и сумма очков по введённому профилю тестов («что если»). Пустые/нулевые тесты пропускаются.
+    1) Каждый тест → уровень (профиль_levels) → уровень связанных видов (взвешенное среднее). Для ядра назад / толчка с места / диска с места — ещё и прямая функция Грузенкина
+       «результат = отношение × тест» вместо уровня (для своего вида).
+    2) Результат вида = очки профиля 7500 × уровень / 7500 (МОЁ).
+    3) Виды без теста: средний уровень по тестам + поправка по корреляциям (синтез трёх таблиц) от отклонений протестированных видов; разброс очков вида — WHATIF_SIG_E (данные Грузенкина)."""
+    notes: List[str] = []
+    clean: Dict[str, float] = {}
+    for k, v in (tests or {}).items():
+        if k not in PROFILE_TESTS or v is None or not np.isfinite(float(v)) or float(v) <= 0:
+            continue
+        lo_r, hi_r = PROFILE_TESTS[k]["rng"]
+        if not (lo_r <= float(v) <= hi_r):
+            notes.append(f"{PROFILE_TESTS[k]['label']}: значение {float(v):g} вне допустимого диапазона {lo_r:g}…{hi_r:g} — не учтено.")
+            continue
+        clean[k] = float(v)
+    R = grz_ratios().set_index("pair")
+    est: Dict[str, List[tuple]] = {e: [] for e in EVENTS}
+    trows = []
+    for tk, v in clean.items():
+        sp = PROFILE_TESTS[tk]
+        lv = profile_levels(tk, v, sources)
+        use_pair = bool(sp.get("pair")) and "grz" in sources
+        if not lv and not use_pair:
+            notes.append(f"{sp['label']}: нет источника при выбранных настройках — не учтено.")
+            continue
+        if lv:
+            Lt = float(np.mean([x[0] for x in lv.values()]))
+            lo = min(min(x[0] for x in lv.values()), Lt - WHATIF_SIG_L)
+            hi = max(max(x[0] for x in lv.values()), Lt + WHATIF_SIG_L)
+            out_r = [("Нариманов" if s == "nar" else "Грузенкин") for s, x in lv.items() if x[1]]
+        else:
+            Lt = lo = hi = float("nan")
+            out_r = []
+        trows.append(dict(test=tk, label=sp["label"], value=v, nar=(lv["nar"][0] if "nar" in lv else np.nan), grz=(lv["grz"][0] if "grz" in lv else np.nan),
+                          level=Lt, outside=", ".join(out_r)))
+        for e, w in sp["ev"]:
+            pair = sp.get("pair", {}).get(e) if use_pair else None
+            if pair:
+                r = R.loc[pair]
+                est[e].append((event_level(e, r.ratio * v), event_level(e, r.lo * v), event_level(e, r.hi * v), w, sp["short"] + " (по отношению Грузенкина)"))
+            elif lv:
+                est[e].append((Lt, lo, hi, w, sp["short"] + ("" if w >= 1.0 else " (побочный тест, вес 0,5)")))
+    tested = [e for e in EVENTS if est[e]]
+    empty = dict(tests=pd.DataFrame(trows, columns=["test", "label", "value", "nar", "grz", "level", "outside"]), events=pd.DataFrame(), level=float("nan"), sum_pts=0.0, sum_lo=0.0, sum_hi=0.0,
+                 cur_sum_pr=None, cur_tour=None, d_vs_tour=None, notes=notes, tested=[])
+    if not tested:
+        return empty
+    L_e, lo_e, hi_e, W_e = {}, {}, {}, {}
+    for e in tested:
+        W = sum(x[3] for x in est[e])
+        W_e[e] = W
+        L_e[e] = sum(x[0] * x[3] for x in est[e]) / W
+        lo_e[e] = sum(x[1] * x[3] for x in est[e]) / W
+        hi_e[e] = sum(x[2] * x[3] for x in est[e]) / W
+    L0 = sum(L_e[e] * W_e[e] for e in tested) / sum(W_e.values())
+    pts, lo_p, hi_p, basis = {}, {}, {}, {}
+    for e in tested:
+        pts[e], lo_p[e], hi_p[e] = _pts_at(e, L_e[e]), _pts_at(e, lo_e[e]), _pts_at(e, hi_e[e])
+        basis[e] = ", ".join(dict.fromkeys(x[4] for x in est[e]))
+    untested = [e for e in EVENTS if e not in tested]
+    if untested:
+        C = synth_corr()
+        ix, iu = [EVENTS.index(e) for e in tested], [EVENTS.index(e) for e in untested]
+        d = np.array([pts[e] - _pts_at(e, L0) for e in tested])
+        Ctt = C[np.ix_(ix, ix)] + 0.05 * np.eye(len(ix))
+        Cut = C[np.ix_(iu, ix)]
+        corr = Cut @ np.linalg.solve(Ctt, d)
+        R2 = np.einsum("ij,ji->i", Cut, np.linalg.solve(Ctt, Cut.T))
+        for k, e in enumerate(untested):
+            pts[e] = max(_pts_at(e, L0) + float(corr[k]), 30.0)
+            h = float(np.sqrt(WHATIF_SIG_E ** 2 * (1.0 - min(float(R2[k]), 0.9)) + (_REF_PTS[e] * WHATIF_SIG_L / 7500.0) ** 2))
+            lo_p[e], hi_p[e] = max(pts[e] - h, 30.0), pts[e] + h
+            basis[e] = "по остальным тестам + связь с видами, где тест есть" if len(tested) > 1 else "по уровню единственного теста"
+    rows = []
+    for e in EVENTS:
+        a, b = float(wa_result(e, lo_p[e])), float(wa_result(e, hi_p[e]))
+        cur = float(current[e]) if current is not None and e in current else None
+        cp = float(wa_points(e, cur)) if cur is not None else None
+        rows.append(dict(event=e, tested=e in tested, pts=pts[e], pts_lo=lo_p[e], pts_hi=hi_p[e], result=float(wa_result(e, pts[e])), res_lo=min(a, b), res_hi=max(a, b),
+                         current=cur, cur_pts=cp, d_pts=(pts[e] - cp if cp is not None else None), basis=basis[e]))
+    ev = pd.DataFrame(rows)
+    sum_pts = float(np.sum(np.floor(ev.pts)))
+    dl_t = float(sum(pts[e] - lo_p[e] for e in tested)); dh_t = float(sum(hi_p[e] - pts[e] for e in tested))
+    dl_u = float(np.sqrt(sum((pts[e] - lo_p[e]) ** 2 for e in untested))); dh_u = float(np.sqrt(sum((hi_p[e] - pts[e]) ** 2 for e in untested)))
+    cur_pr = float(np.sum(np.floor([float(wa_points(e, current[e])) for e in EVENTS]))) if current is not None else None
+    cur_tour = (cur_pr - loss) if cur_pr is not None else None
+    return dict(tests=pd.DataFrame(trows, columns=["test", "label", "value", "nar", "grz", "level", "outside"]), events=ev, level=float(L0), sum_pts=sum_pts,
+                sum_lo=sum_pts - float(np.sqrt(dl_t ** 2 + dl_u ** 2)), sum_hi=sum_pts + float(np.sqrt(dh_t ** 2 + dh_u ** 2)), cur_sum_pr=cur_pr, cur_tour=cur_tour,
+                d_vs_tour=(sum_pts - cur_tour if cur_tour is not None else None), notes=notes, tested=tested)
+
+
+def profile_sensitivity(tests: Dict[str, float], current: Optional[Dict[str, float]] = None, sources: Sequence[str] = ("nar", "grz")) -> pd.DataFrame:
+    """Что даёт «шаг» в каждом введённом тесте (рывок +5 кг, жим +5 кг, тройной +0,10 м, ядро назад +0,5 м, толчок +0,5 м, диск +2 м, 30 м −0,05 с, 1000 м −5 с) при остальных без изменений."""
+    base = profile_whatif(tests, current, sources=sources)
+    rows = []
+    for tk, v in (tests or {}).items():
+        if tk not in PROFILE_TESTS or v is None or float(v) <= 0 or not len(base["events"]) or tk not in set(base["tests"].test):
+            continue
+        sp = PROFILE_TESTS[tk]
+        t2 = dict(tests); t2[tk] = float(v) + sp["step"]
+        r2 = profile_whatif(t2, current, sources=sources)
+        evb, ev2 = base["events"].set_index("event"), r2["events"].set_index("event")
+        dd = (ev2.pts - evb.pts)
+        top = dd.abs().sort_values(ascending=False).index[:3]
+        rows.append(dict(test=tk, label=sp["label"], step=sp["step"], d_sum=r2["sum_pts"] - base["sum_pts"], d_level=r2["level"] - base["level"],
+                         main=", ".join(f"{e} {dd[e]:+.0f}" for e in top if abs(dd[e]) >= 0.5)))
+    return pd.DataFrame(rows, columns=["test", "label", "step", "d_sum", "d_level", "main"])
+
+
+def corr_top_pairs(k: int = 8) -> pd.DataFrame:
+    """Самые сильные связи очков между видами (синтез таблиц 2012 / 1952–60 / эксперт) — чтобы видеть, что из чего можно (и нельзя) выводить."""
+    C = synth_corr()
+    rows = [dict(a=EVENTS[i], b=EVENTS[j], r=float(C[i, j])) for i in range(10) for j in range(i + 1, 10)]
+    return pd.DataFrame(rows).sort_values("r", key=lambda s: -s.abs()).head(k).reset_index(drop=True)
+
+
+def profile_validation() -> dict:
+    """Проверка на группе Грузенкина (там известны и тесты, и результаты). Независима только таблица Нариманова: линия Грузенкина по построению проходит через сумму группы.
+    Берём тесты группы (жим, ядро назад, тройной), считаем сумму ТОЛЬКО по Нариманову и сравниваем с фактической суммой группы и очками ядра/длины."""
+    rows = []
+    for lab, idx, S in (("до эксперимента", 0, GRZ_SUM[0]), ("лучшие за период", 3, GRZ_SUM[1])):
+        t = {"bench": GRZ_T1["bench_kg"][idx], "shot_bwd": GRZ_T1["bwd_cm"][idx] / 100.0, "triple_sj": GRZ_T1["triple_cm"][idx] / 100.0}
+        r = profile_whatif(t, sources=("nar",))
+        ev = r["events"].set_index("event")
+        k_ = 0 if idx == 0 else 1
+        act = {e: float(np.mean([float(wa_points(e, a[k_])) for a in GRZ_T4[e]])) for e in ("SP", "DT", "JT")}
+        act["LJ"] = float(np.mean([float(wa_points("LJ", a[k_] / 100.0)) for a in GRZ_T4["LJ_cm"]]))
+        rows.append(dict(period=lab, sum_fact=S, sum_model=r["sum_pts"], err=r["sum_pts"] - S, **{f"{e}_fact": act[e] for e in act}, **{f"{e}_model": float(ev.loc[e, "pts"]) for e in act}))
+    return dict(table=pd.DataFrame(rows), sig_level=WHATIF_SIG_L, sig_event=WHATIF_SIG_E, nar_errors=_nar_group_errors())
+
+
+def whatif_selftest():
+    cur = samandyk().current
+    # константы получены из данных, а не заданы
+    assert abs(GRZ_SUM[0] - 7647.5) < 1e-9 and abs(GRZ_SUM[1] - 7859.0) < 1e-9
+    assert 300 < WHATIF_SIG_L < 650 and 50 < WHATIF_SIG_E < 80, (WHATIF_SIG_L, WHATIF_SIG_E)
+    # линия Грузенкина проходит через оба якоря и продолжается за ними
+    a, b = GRZ_T1["snatch_kg"][0], GRZ_T1["snatch_kg"][3]
+    assert abs(profile_levels("snatch", a)["grz"][0] - GRZ_SUM[0]) < 1e-9 and abs(profile_levels("snatch", b)["grz"][0] - GRZ_SUM[1]) < 1e-9
+    L90, out90 = profile_levels("snatch", 90.0)["grz"]
+    assert out90 and L90 > GRZ_SUM[1], "90 кг выше лучших у группы: экстраполяция помечена"
+    assert not profile_levels("snatch", 85.0)["grz"][1]
+    lt = profile_levels("fly30", 3.0)["grz"][0]
+    assert lt > profile_levels("fly30", 3.1)["grz"][0], "время меньше — уровень выше"
+    assert profile_levels("t1000", 160.0)["nar"][0] > profile_levels("t1000", 190.0)["nar"][0]
+    # нулевые/пустые тесты
+    assert profile_whatif({}, cur)["events"].empty and profile_whatif({"snatch": 0, "bench": None}, cur)["events"].empty
+    bad = profile_whatif({"bench": 900.0}, cur)
+    assert bad["events"].empty and bad["notes"], "значение вне диапазона не принимается"
+    # пример пользователя: рывок 90, жим 110, тройной 9,40
+    r = profile_whatif({"snatch": 90.0, "bench": 110.0, "triple_sj": 9.40}, cur)
+    ev = r["events"].set_index("event")
+    assert set(r["tested"]) == {"LJ", "SP", "DT", "JT"} and len(ev) == 10
+    assert 7600 < r["sum_pts"] < 8100 and r["sum_lo"] < r["sum_pts"] < r["sum_hi"], r["sum_pts"]
+    assert (ev.pts_lo <= ev.pts).all() and (ev.pts <= ev.pts_hi).all() and (ev.res_lo <= ev.result + 1e-9).all() and (ev.result <= ev.res_hi + 1e-9).all()
+    assert ev.loc["LJ", "tested"] and not ev.loc["HJ", "tested"]
+    # монотонность: больше рывок/жим/тройной — больше сумма; меньше время — больше сумма
+    base = profile_whatif({"snatch": 85.0, "bench": 105.0, "triple_sj": 9.2, "fly30": 3.1, "t1000": 175.0}, cur)["sum_pts"]
+    for k, dv in (("snatch", 5.0), ("bench", 5.0), ("triple_sj", 0.1), ("fly30", -0.05), ("t1000", -5.0)):
+        t = {"snatch": 85.0, "bench": 105.0, "triple_sj": 9.2, "fly30": 3.1, "t1000": 175.0}; t[k] += dv
+        assert profile_whatif(t, cur)["sum_pts"] > base, k
+    # прямая функция Грузенкина: диск с места 33 → результат диска ≈ отношение × тест
+    r2 = profile_whatif({"stand_dt": 33.0}, cur)
+    lo_, mid_, hi_ = expected_from_test("DT_stand", 33.0)
+    assert abs(r2["events"].set_index("event").loc["DT", "result"] - mid_) < 0.05 and r2["tested"] == ["DT"]
+    # один вид с тестом → остальные идут по его уровню, без поправки по корреляциям
+    ev2 = r2["events"].set_index("event")
+    assert abs(ev2.loc["LJ", "pts"] - _pts_at("LJ", r2["level"])) < 1e-6
+    # корреляции работают: сильный вид с тестом сдвигает коррелирующий (ядро ↔ диск 0,65) вид без теста
+    ra = profile_whatif({"stand_put": 15.5, "triple_sj": 8.6}, cur); rb = profile_whatif({"stand_put": 11.0, "triple_sj": 8.6}, cur)
+    ea, eb = ra["events"].set_index("event"), rb["events"].set_index("event")
+    assert ea.loc["DT", "pts"] - _pts_at("DT", ra["level"]) > 0 > eb.loc["DT", "pts"] - _pts_at("DT", rb["level"]), "ядро выше уровня → диск (r=0,65) выше уровня; ядро ниже → ниже"
+    # чувствительность
+    s = profile_sensitivity({"snatch": 85.0, "bench": 105.0, "triple_sj": 9.2}, cur)
+    assert len(s) == 3 and (s.d_sum > 0).all(), s
+    # проверка по группе Грузенкина (только Нариманов): сумма завышается, ошибки конечны и в пределах двух σ уровня
+    v = profile_validation()["table"]
+    assert (v.err.abs() < 2 * WHATIF_SIG_L).all(), v.err.tolist()
+    assert len(corr_top_pairs(5)) == 5 and corr_top_pairs(1).iloc[0].r > 0.5
+    # рывок из журнала: ≤ 3 повторений, вес
+    lg = [dict(date="2026-10-10", items=[dict(id="st_snatch", sets=3, reps=2, size=80.0), dict(id="st_snatch", sets=1, reps=8, size=100.0)])]
+    tj = tests_from_journal(lg, "2026-10-12")
+    assert tj["snatch"]["value"] == 80.0, "подходы на 8 повторений не считаются оценкой максимума"
 
 
 def quick_selftest():
@@ -4980,6 +5240,7 @@ def selftest():
     live_selftest()
     potential_selftest()
     quick_selftest()
+    whatif_selftest()
 
 
 def run_library():
@@ -5371,6 +5632,7 @@ with SEC[3]:
 with SEC[4]:
     SET = st.tabs(["👤 Профиль", "📅 Календарь и объём", "🧠 Модель", "🔧 Правила плана", "ℹ️ Как это работает", "💾 Копия данных"])
 tabs = {0: SEC[0], 1: DIA[0], 2: DIA[1], 11: DIA[2], 3: PLN[0], 12: PLN[1], 4: FC[0], 5: FC[1], 6: FC[2], 7: FC[3], 8: FC[4], 9: FC[5], 10: SET[4]}
+APP_BUILD = "12.10.2026 13:17 (Минск)"                                # подставляется сборщиком (build_single.py)
 SIDE_STATUS = st.sidebar.container()                   # статус сохранения (рисуется в самом конце, когда известен итог прогона)
 
 # ───────────────────────── боковая панель: данные ─────────────────────────
@@ -6247,6 +6509,9 @@ with tabs[8]:
 # ───────────────────────── тесты ─────────────────────────
 with tabs[9]:
     st.subheader("Тесты СФП и потенциал")
+    st.info("На этой вкладке сверху вниз: ① какие значения тестов соответствуют уровню · ② оценка ваших тестов по Нариманову · ③ функция «тест → результат вида» (Грузенкин) · "
+            "④ **«Что если»: введите рывок, жим, тройной, ядро, диск, 30 м, 1000 м — получите результаты по десяти видам и сумму очков** · ⑤ потенциал к старту (рост по Хейнла, пауза, доля плана) · "
+            "⑥ ориентиры тестов на контрольные дни · ⑦ динамика тестов у группы Грузенкина.")
     st.caption("Тесты берутся из журнала сами (лучший за 120 дней) и сопоставляются с таблицей Нариманова; из профиля — только если отмечено «Тесты замерены лично». "
                "Ядро учитывается только весом 7,26 кг; Vmax = 30 м / время с хода; жим — оценка 1ПМ по формуле Эпли (вес × (1 + повторы/30)).")
     LV = [7000, int(sum_cur), 7500, 8000]
@@ -6297,26 +6562,107 @@ with tabs[9]:
         st.dataframe(pd.DataFrame(trr_), use_container_width=True, hide_index=True)
     else:
         st.info("Нужен хотя бы один замер из трёх: бросок ядра назад 7,26 кг, толчок ядра с места, бросок диска с места (категория «Контроль» / «Ядро» / «Диск» в «Моя тренировка»).")
-    st.markdown("**Что если** (введите значение теста, получите ожидаемый результат вида; 0 — не считать)")
-    wc1, wc2, wc3 = st.columns(3)
-    wi_ = {"SP_bwd": wc1.number_input("Ядро назад 7,26 кг, м", 0.0, 22.0, 0.0, 0.1, key="wi_bwd"),
-           "SP_stand": wc2.number_input("Толчок ядра с места, м", 0.0, 20.0, 0.0, 0.1, key="wi_put"),
-           "DT_stand": wc3.number_input("Диск с места 2 кг, м", 0.0, 65.0, 0.0, 0.5, key="wi_dt")}
-    wrows_ = []
-    for k_, v_ in wi_.items():
-        if v_ > 0:
-            ev_ = ds.GRZ_COUPLE[k_][0]
-            lo_, mid_, hi_ = ds.expected_from_test(k_, float(v_))
-            wrows_.append({"Тест": LBL_[k_].split(" → ")[0], "Значение": v_, "Ожидаемо": f"{lo_:.2f}…{hi_:.2f} (≈{mid_:.2f})", "Ваш результат": res[ev_],
-                           "Очков, если выйдете на ≈": f"{float(ds.wa_points(ev_, mid_)) - float(ds.wa_points(ev_, res[ev_])):+.0f}"})
-    if wrows_:
-        st.dataframe(pd.DataFrame(wrows_), use_container_width=True, hide_index=True)
-        st.caption("Это ожидание для мастера уровня группы Грузенкина. Если полный результат у вас ниже, значит, разрыв в технике или в реализации теста; он закрывается не прибавкой силы. "
-                   "Рывок, жим и присед в функцию не входят: у Грузенкина для них есть только групповые средние (рывок +6,9 кг и ядро +0,67 м за сезон шли вместе), из двух точек зависимость не вывести.")
+    # ───── «Что если»: профиль силы и прыжков → результаты видов и сумма очков ─────
+    st.markdown("#### «Что если»: профиль силы и прыжков → результаты видов и очки")
+    st.caption("Введите значения тестов (0 — не учитывать). Модель покажет, какие результаты по десяти видам и какую сумму очков такой профиль обычно даёт, и сравнит с вашими. "
+               "Чем больше тестов введёте, тем меньше в ответе «додуманного»: по видам без теста результат берётся из общего уровня и связей между видами.")
+    WF_SPEC = {"snatch": (0.0, 160.0, 2.5), "bench": (0.0, 220.0, 2.5), "triple_sj": (0.0, 11.5, 0.05), "shot_bwd": (0.0, 22.0, 0.1),
+               "stand_put": (0.0, 20.0, 0.1), "stand_dt": (0.0, 65.0, 0.5), "fly30": (0.0, 4.5, 0.01), "t1000": (0.0, 400.0, 1.0)}
+
+    def _wf_fill():
+        tv_ = dict(TEST_VALS)
+        if tv_.get("vmax"):
+            tv_["fly30"] = 30.0 / float(tv_["vmax"])
+        for k_ in WF_SPEC:
+            st.session_state["wf_" + k_] = float(tv_.get(k_, 0.0))
+
+    def _wf_clear():
+        for k_ in WF_SPEC:
+            st.session_state["wf_" + k_] = 0.0
+
+    wb1, wb2, _wb3 = st.columns([1, 1, 2])
+    wb1.button("Подставить мои замеры из журнала", on_click=_wf_fill, key="wf_fill", disabled=not TEST_VALS)
+    wb2.button("Очистить", on_click=_wf_clear, key="wf_clear")
+    wcols_ = st.columns(4)
+    WI = {}
+    for i_, (k_, (lo_, hi_, stp_)) in enumerate(WF_SPEC.items()):
+        WI[k_] = wcols_[i_ % 4].number_input(ds.PROFILE_TESTS[k_]["label"], lo_, hi_, 0.0, stp_, key="wf_" + k_)
+    st.caption("Присед: нормативов в доступных источниках нет (ни у Нариманова, ни у Грузенкина, ни у Рудских), поэтому в расчёте он не участвует. "
+               "Рывок есть только у Грузенкина (групповые средние 82,6 → 87,6 кг), у Нариманова его нет.")
+    WF = ds.profile_whatif({k_: v_ for k_, v_ in WI.items() if v_ > 0}, res, float(loss_n))
+    for n_ in WF["notes"]:
+        st.warning(n_)
+    if not len(WF["events"]):
+        _ex = ds.profile_whatif({"snatch": 90.0, "bench": 110.0, "triple_sj": 9.40}, res, float(loss_n))
+        st.info(f"Пример: рывок 90 кг, жим 110 кг, тройной с места 9,40 м → уровень ≈ {_ex['level']:.0f}, сумма очков ≈ {_ex['sum_pts']:.0f} "
+                f"(коридор {_ex['sum_lo']:.0f}…{_ex['sum_hi']:.0f}). Введите свои значения выше.")
     else:
-        _e1, _e2, _e3 = ds.expected_from_test("DT_stand", 33.0), ds.expected_from_test("SP_stand", 13.0), ds.expected_from_test("SP_bwd", 15.0)
-        st.caption(f"Пример: диск с места 33 м → ожидаемо {_e1[0]:.1f}…{_e1[2]:.1f} м (≈{_e1[1]:.1f}); ядро с места 13 м → {_e2[0]:.1f}…{_e2[2]:.1f} м; ядро назад 15,0 м → {_e3[0]:.1f}…{_e3[2]:.1f} м. "
-                   "Рывок, жим и присед в функцию не входят: у Грузенкина для них есть только групповые средние, зависимость из них не вывести.")
+        wm1, wm2, wm3, wm4 = st.columns(4)
+        wm1.metric("Уровень по тестам", f"{WF['level']:.0f}", "средний по протестированным видам")
+        wm2.metric("Сумма очков по профилю", f"{WF['sum_pts']:.0f}", f"коридор {WF['sum_lo']:.0f}…{WF['sum_hi']:.0f}", delta_color="off")
+        wm3.metric("Ваш турнир (сумма личных − потери)", f"{WF['cur_tour']:.0f}", f"профиль {WF['d_vs_tour']:+.0f}")
+        wm4.metric("Видов с тестом", f"{len(WF['tested'])} из 10")
+        wt_ = WF["tests"]
+        st.dataframe(pd.DataFrame([{"Тест": r_.label, "Значение": r_.value,
+                                    "Уровень по Нариманову": ("—" if pd.isna(r_.nar) else f"{r_.nar:.0f}"), "Уровень по Грузенкину": ("—" if pd.isna(r_.grz) else f"{r_.grz:.0f}"),
+                                    "Принятый уровень": ("прямая функция" if pd.isna(r_.level) else f"{r_.level:.0f}"),
+                                    "Замечание": (f"вне диапазона источника ({r_.outside}) — экстраполяция" if r_.outside else "")} for r_ in wt_.itertuples()]),
+                     use_container_width=True, hide_index=True)
+        rows_ = []
+        for r_ in WF["events"].itertuples():
+            f_ = (lambda x: fmt_t(x)) if r_.event == "1500m" else (lambda x: f"{x:.2f}")
+            rows_.append({"Вид": RU[r_.event], "Основа": ("тест" if r_.tested else "связи/уровень"), "Ожидаемый результат": f_(r_.result),
+                          "Коридор": f"{f_(r_.res_lo)}…{f_(r_.res_hi)}", "Очки": int(r_.pts), "Ваш ЛР": f_(r_.current), "Очки ЛР": int(r_.cur_pts),
+                          "Профиль − ЛР, очков": f"{r_.d_pts:+.0f}", "На чём основано": r_.basis})
+        st.dataframe(pd.DataFrame(rows_), use_container_width=True, hide_index=True)
+        evw_ = WF["events"].set_index("event")
+        tt_ = evw_[evw_.tested].sort_values("d_pts", ascending=False)
+        if len(tt_):
+            res_ = [f"{RU[e_]} {d_:+.0f}" for e_, d_ in tt_.d_pts.items() if d_ >= 50]
+            low_ = [f"{RU[e_]} {d_:+.0f}" for e_, d_ in tt_.d_pts.items() if d_ <= -50]
+            msg_ = []
+            if res_:
+                msg_.append("Результат ниже, чем такой тест «поддерживает» (резерв в технике и реализации, не в силе): " + ", ".join(res_) + ".")
+            if low_:
+                msg_.append("Результат выше, чем этот тест: " + ", ".join(low_) + " (упираетесь в тест — здесь прибавка силы или скорости нужна).")
+            if not msg_:
+                msg_.append("По видам с тестом ваши личные результаты совпадают с профилем в пределах ±50 очков.")
+            msg_.append("По видам «связи/уровень» сравнение с ЛР — это сравнение с уровнем «сбалансированного» спортсмена: тестом оно не подтверждено.")
+            st.info(" ".join(msg_))
+        sens_ = ds.profile_sensitivity({k_: v_ for k_, v_ in WI.items() if v_ > 0}, res)
+        if len(sens_):
+            st.markdown("**Что даёт шаг в каждом тесте** (остальные без изменений)")
+            st.dataframe(pd.DataFrame([{"Тест": r_.label, "Шаг": f"{r_.step:+g}", "Сумма очков": f"{r_.d_sum:+.0f}", "Уровень": f"{r_.d_level:+.0f}", "Главное по видам": r_.main}
+                                       for r_ in sens_.itertuples()]), use_container_width=True, hide_index=True)
+        st.caption("Результаты — «типичные для такого профиля», а не прогноз именно для вас: это среднее по спортсменам; ваш личный разрыв (техника, реализация, травмы) сюда не входит. "
+                   "Сумма — турнирного типа (профиль 7500 в моей шкале), поэтому сравнивается с вашей суммой личных минус потери. Очки ЛР у вида обычно выше турнирных на ≈30, учитывайте это при сравнении.")
+
+    with st.expander("Как связаны виды между собой (корреляции из литературы)"):
+        cp_ = ds.corr_top_pairs(8)
+        st.dataframe(pd.DataFrame([{"Пара": f"{RU[r_.a]} – {RU[r_.b]}", "Корреляция очков": round(r_.r, 2)} for r_ in cp_.itertuples()]), use_container_width=True, hide_index=True)
+        st.caption("Синтез трёх таблиц: сильнейшие десятиборцы мира (Юшкевич, Романов, 2012), Олимпиады 1952–60 (журнал «Лёгкая атлетика») и экспертная матрица (вес малый). "
+                   "Связи слабые: заметны только ядро – диск, 100 м – барьеры – длина – 400 м. Поэтому из силовых тестов результат метаний выводится, а бег и прыжки — почти нет: "
+                   "по ним расчёт берёт общий уровень, а не «додумывает» связь. Это корреляции между спортсменами, а не прирост одного вида при росте другого у вас.")
+    with st.expander("Проверка: как расчёт ведёт себя на группе Грузенкина"):
+        PV_ = ds.profile_validation()
+        tb_ = PV_["table"]
+        st.dataframe(pd.DataFrame([{"Момент": r_.period, "Сумма группы (факт)": round(r_.sum_fact), "Сумма по Нариманову (жим, ядро назад, тройной)": round(r_.sum_model),
+                                    "Ошибка": f"{r_.err:+.0f}", "Ядро: факт / модель": f"{r_.SP_fact:.0f} / {r_.SP_model:.0f}", "Длина: факт / модель": f"{r_.LJ_fact:.0f} / {r_.LJ_model:.0f}",
+                                    "Диск: факт / модель": f"{r_.DT_fact:.0f} / {r_.DT_model:.0f}", "Копьё: факт / модель": f"{r_.JT_fact:.0f} / {r_.JT_model:.0f}"} for r_ in tb_.itertuples()]),
+                     use_container_width=True, hide_index=True)
+        st.caption(f"Тесты группы подставлены в расчёт, как если бы это были ваши (только таблица Нариманова — линия Грузенкина по построению проходит через сумму группы и проверкой не служит). "
+                   f"Расчёт завышает: после сезона тесты группы (жим 120,8, тройной 9,60) по Нариманову «стоят» больше, чем группа набрала. Среднеквадратичная ошибка одного теста ≈ {PV_['sig_level']:.0f} очков суммы "
+                   f"— отсюда ширина коридора. Разброс очков одного вида внутри группы ≈ {PV_['sig_event']:.0f} (шесть спортсменов, четыре вида).")
+    with st.expander("Что здесь из источников, а что моё"):
+        st.markdown(
+            "**Из источников:** таблица Нариманова (какое значение жима, тройного, ядра назад, 1000 м соответствует какой сумме очков); Грузенкин (1990) — средние тесты группы мастеров в двух точках "
+            "(рывок, жим, ядро назад, толчок и диск с места, тройной, 30 м с хода ↔ сумма 7647,5 → 7859,0) и отношения «результат вида / тест»; корреляции между видами (три таблицы).\n\n"
+            "**Моё:** профиль «7500» как способ перевести уровень в результат вида; линия Грузенкина как «значение теста → уровень» (это динамика одной группы за сезон, не срез по спортсменам — "
+            "вне диапазона группы, для рывка 82,6…87,6 кг, это экстраполяция); вес 1 у «своего» теста и 0,5 у побочных (рывок → метания, жим → ядро и копьё, ядро назад → диск и копьё, 30 м → барьеры и длина); "
+            "перенос отклонений на виды без теста при одинаковом разбросе очков; ширина коридора.\n\n"
+            "**Чего нет:** зависимости «рывок → результат», выведенной по спортсменам. У Грузенкина тесты даны только средними по группе (6–8 человек), в таблице Рудских силовых тестов нет, "
+            "у Нариманова нет рывка и приседа. Поэтому рывок здесь — показатель общего уровня силы, а не доказанный предсказатель конкретного вида.\n\n"
+            "Бег 30 м с хода берётся только по Грузенкину: «Vmax» Нариманова измерен иначе (30 м / время даёт по его таблице для той же группы ≈6000–6800 вместо 7650–7860).")
 
     st.markdown("#### Потенциал к старту десятиборья")
     H_G = max(0, (d_dec - real_today).days)
@@ -6673,6 +7019,7 @@ with SIDE_STATUS:
     st.caption("Последнее сохранение: " + (pd.Timestamp(_sa).strftime("%d.%m %H:%M") if _sa else "ещё не было"))
     st.caption(f"Дней в дневнике: {len(LOG)}" + (f" · последний {max(e['date'] for e in LOG)}" if LOG else ""))
     st.caption("Настройки сохраняются сами при каждом изменении. Записи дневника — по кнопкам «Записать».")
+    st.caption(f"Сборка от {APP_BUILD}")
     st.markdown("---")
     st.metric("Прогноз модели к старту", f"{F['sum_forecast']:.0f}", f"{F['sum_forecast'] - F0['sum_forecast']:+.0f} к эталону")
     st.caption(f"До семиборья {max(0, (d_hept - real_today).days)} дн. · до десятиборья {max(0, (d_dec - real_today).days)} дн.")
