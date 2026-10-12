@@ -1474,7 +1474,10 @@ def warm_start(model: PerfModel, library: SessionLibrary = LIBRARY, gcfg: GateCo
 
 class DailySolver:
     def __init__(self, model: PerfModel, athlete: Athlete, state: SolverState, library: SessionLibrary = LIBRARY,
-                 gcfg: GateConfig = GateConfig(), limits: PlanLimits = PlanLimits()):
+                 gcfg: GateConfig = GateConfig(), limits: PlanLimits = PlanLimits(), ref: Optional[SolverState] = None):
+        """state — с чего начинается проигрывание плана (по журналу или типовая неделя). ref — состояние, в котором «выставлены» личные результаты
+        (точка отсчёта формы y0). По умолчанию совпадает со state (холодный старт). С журналом ref ДОЛЖЕН быть эталонным: иначе усталость от
+        вчерашней тяжёлой тренировки занижает «стартовую форму» и прогноз растёт ни с чего (рекорды ставились не в усталом состоянии)."""
         self.m, self.ath, self.s0, self.lib, self.gc, self.lim = model, athlete, state, library, gcfg, limits
         self.gates = BioGates(gcfg, model.const)
         self.names = [s.key for s in library]
@@ -1507,8 +1510,8 @@ class DailySolver:
         for i, g in enumerate(gn):
             if limits.group_need[g] >= 2:
                 self.cap[self.G[:, i] > 0] = 1
-        p0 = state.ast.pools_at(state.t0).P
-        self.y0 = model.form(state.g, p0)
+        rf = ref if ref is not None else state
+        self.y0 = model.form(rf.g, rf.ast.pools_at(rf.t0).P)
 
     # ── прогноз ──
     def results(self, g, pools) -> np.ndarray:
@@ -2496,9 +2499,9 @@ _MAINT_VOL = {"sprint": 120.0, "hurdles": 12.0, "LJ": 6.0, "HJ": 8.0, "PV": 6.0,
 
 
 def grz_session_text(g: str, m: int, amount: Dict[str, float], ex: str) -> Tuple[str, str]:
+    """Текст занятия и ключ библиотеки для группы g в месяце m при объёме на занятие amount (в единицах таблицы)."""
     if g.endswith("~"):
         return _GRZ_MAINT[g[:-1]]
-    """Текст занятия и ключ библиотеки для группы g в месяце m при объёме на занятие amount (в единицах таблицы)."""
     f = lambda k: amount.get(k, 0.0)
     if g == "sprint":
         a, b = f("run80_96") * 1000, f("run80_91") * 1000
@@ -2940,7 +2943,8 @@ def live_forecast(current: Dict[str, float], mass: float, seq: Sequence[str], mo
     Всё считается заново при любом изменении входов (≈0,1 с на 241 день + MC 4000 розыгрышей)."""
     model = model or PerfModel.from_prior()
     ath = Athlete("live", float(mass), dict(current), tuple(already_day2), dict(noise_sd or {e: 60.0 for e in EVENTS}))
-    sol = DailySolver(model, ath, state if state is not None else warm_start(model))
+    ref = warm_start(model)                                   # личные результаты отнесены к форме «после типовой недели» (см. DailySolver)
+    sol = DailySolver(model, ath, state if state is not None else ref, ref=ref)
     seq = list(seq)
     feas, obj, res = sol.evaluate(seq)
     _, _, res_typ = sol.evaluate(TYPICAL_SEQ(len(seq)))
@@ -3001,6 +3005,568 @@ def required_for_target(current: Dict[str, float], target: float, basis: str = "
     return out
 
 
+# ═════════════════════════════ 9d-2. ПРОГНОЗ И ТРЕНИРОВОЧНЫЕ РЕЗУЛЬТАТЫ ═════════════════════════════
+def forecast_seq(plan_df: pd.DataFrame, last_logged: Optional[pd.Timestamp], today: pd.Timestamp, with_dates: bool = False):
+    """Последовательность сессий для прогноза: дни после последней записи до сегодняшнего (не включая) — ОТДЫХ (нет записи = не тренировался; так же
+    считает журнал), с сегодняшнего дня — план. Раньше проигрывание плана начиналось на следующий день после последней записи, и двухмесячная
+    пауза в записях прогноз почти не меняла. Без журнала (last_logged=None) — просто план с сегодняшнего дня."""
+    today = pd.Timestamp(today).normalize()
+    pl = plan_df.assign(_d=pd.to_datetime(plan_df["date"]).dt.normalize()).sort_values("_d")
+    if last_logged is None:
+        start, gap = today, 0
+    else:
+        nxt = pd.Timestamp(last_logged).normalize() + pd.Timedelta(days=1)
+        start = max(today, nxt)
+        gap = (start - nxt).days
+    tail = pl[pl["_d"] >= start]
+    keys = ["S_REST"] * gap + list(tail["session_key"])
+    if not with_dates:
+        return keys
+    dates = [start - pd.Timedelta(days=gap - i) for i in range(gap)] + list(tail["_d"])
+    return keys, dates
+
+
+def forecast_sum(current: Dict[str, float], mass: float, seq: Sequence[str], model: Optional["PerfModel"] = None, state: Optional["SolverState"] = None,
+                 noise_sd: Optional[Dict[str, float]] = None, ref: Optional["SolverState"] = None) -> float:
+    """Сумма очков прогноза на последний день seq (без Монте-Карло, ≈0,1 с). Так же, как live_forecast: личные результаты отнесены к типовой форме."""
+    model = model or PerfModel.from_prior()
+    ath = Athlete("live", float(mass), dict(current), ("DT", "JT", "1500m"), dict(noise_sd or {e: 60.0 for e in EVENTS}))
+    ref = ref or warm_start(model)
+    sol = DailySolver(model, ath, state if state is not None else ref, ref=ref)
+    _, _, res = sol.evaluate(list(seq))
+    return float(sum(pts_table(res).values()))
+
+
+def pause_scenario(plan_df: pd.DataFrame, today: pd.Timestamp, start: pd.Timestamp, days: int, targets: Dict[str, pd.Timestamp], current: Dict[str, float],
+                   mass: float, model: Optional["PerfModel"] = None, state: Optional["SolverState"] = None, last_logged: Optional[pd.Timestamp] = None) -> pd.DataFrame:
+    """«Что если пауза»: те же дни плана, но с `start` на `days` дней — отдых. Для каждой даты-цели: прогноз формы в этот день по плану и с паузой.
+    Очки считаются по шкале десятиборья на указанный день (для даты семиборья это «форма на эту дату», а не прогноз семиборья)."""
+    keys, dates = forecast_seq(plan_df, last_logged, today, with_dates=True)
+    st0, en0 = pd.Timestamp(start).normalize(), pd.Timestamp(start).normalize() + pd.Timedelta(days=int(days))
+    paused = ["S_REST" if st0 <= d < en0 else k for k, d in zip(keys, dates)]
+    model = model or PerfModel.from_prior()
+    ref = warm_start(model)
+    rows = []
+    for name, d in targets.items():
+        d = pd.Timestamp(d).normalize()
+        if d not in dates:
+            continue
+        i = dates.index(d)
+        a = forecast_sum(current, mass, keys[:i + 1], model, state, ref=ref)
+        b = forecast_sum(current, mass, paused[:i + 1], model, state, ref=ref)
+        rows.append(dict(target=name, date=str(d.date()), plan=round(a, 1), pause=round(b, 1), delta=round(b - a, 1)))
+    return pd.DataFrame(rows, columns=["target", "date", "plan", "pause", "delta"])
+
+
+# Упражнения каталога, которые и есть сам вид (полное движение, соревновательный снаряд) → вид десятиборья, дистанция (м) для времён
+EVENT_EQUIV = {"sp_full": ("SP", None), "sp_comp": ("SP", None), "dt_full": ("DT", None), "dt_comp": ("DT", None), "jt_full": ("JT", None), "jt_comp": ("JT", None),
+               "lj_full": ("LJ", None), "lj_comp": ("LJ", None), "hj_full": ("HJ", None), "hj_bar": ("HJ", None), "hj_prog": ("HJ", None),
+               "pv_full": ("PV", None), "pv_bar": ("PV", None), "ts_100": ("100m", 100.0), "h_110": ("110mH", 110.0), "se_400": ("400m", 400.0), "en_1500": ("1500m", 1500.0)}
+STD_COMP_IMPL = {"SP": 7.26, "DT": 2.0, "JT": 0.8}          # соревновательные снаряды десятиборья, кг
+
+
+def pr_candidates(log: Sequence[dict], current: Dict[str, float]) -> pd.DataFrame:
+    """Результаты тренировок, которые ЛУЧШЕ личного результата вида — но только в упражнениях, являющихся самим видом (полный бросок/прыжок/забег
+    с соревновательным снарядом). Метание с места, тесты, тяжёлые/лёгкие снаряды и силовые сюда не попадают: связь с результатом вида у них иная.
+    Это КАНДИДАТЫ: тренировочный результат не рекорд (ветер, замер, правила), решение — за вами."""
+    h = result_history(log)
+    best: Dict[str, dict] = {}
+    for lst in h.values():
+        for p in lst:
+            q = EVENT_EQUIV.get(p["id"])
+            if not q:
+                continue
+            e, dist = q
+            c = CAT[p["id"]]
+            if e in STD_COMP_IMPL and p.get("impl") and abs(float(p["impl"]) - STD_COMP_IMPL[e]) > 1e-6:
+                continue
+            if dist:
+                d_m = float(p.get("size") or 0) * (1000.0 if c.size_unit == "км" else 1.0)
+                if not d_m or abs(d_m - dist) > 0.01 * dist:
+                    continue
+            v, cur = float(p["best"]), float(current[e])
+            if (v < cur) if IS_TIME[e] else (v > cur):
+                if e not in best or ((v < best[e]["value"]) if IS_TIME[e] else (v > best[e]["value"])):
+                    best[e] = dict(event=e, exercise=c.name, date=p["date"], value=v, current=cur,
+                                   d_pts=float(wa_points(e, v, floor=True)) - float(wa_points(e, cur, floor=True)))
+    rows = [r for r in best.values() if r["d_pts"] >= 1]
+    return pd.DataFrame(rows, columns=["event", "exercise", "date", "value", "current", "d_pts"]).sort_values("d_pts", ascending=False).reset_index(drop=True)
+
+
+# «упрощённое → полное»: сколько составляет бросок/прыжок с места от полного именно у вас (из ваших пар в журнале; чужих коэффициентов я не подставляю)
+PAIR_DEFS = {"DT": (("dt_stand", "ts_dt_stand", "dt_stand_full"), ("dt_full", "dt_comp")),
+             "SP": (("sp_stand", "sp_fwd_stand", "ts_sp_fwd"), ("sp_full", "sp_comp")),
+             "LJ": (("lj_stand", "ts_sj"), ("lj_full", "lj_comp")),
+             "JT": (("jt_stand", "jt_3step", "jt_short"), ("jt_full", "jt_comp"))}
+
+
+def pair_ratio(log: Sequence[dict], current: Optional[Dict[str, float]] = None, window_days: int = 3) -> pd.DataFrame:
+    """По каждому упрощённому упражнению: пары «оно ↔ полный бросок/прыжок того же вида в пределах window_days (по умолчанию 3 дня)», отношение (простое/полное),
+    медиана, и если пар ≥ 2 — оценка «полного» по последнему простому результату. Это ОЦЕНКА по вашим данным, не коэффициент из литературы."""
+    h = result_history(log)
+    rows = []
+    for e, (simple, full) in PAIR_DEFS.items():
+        F_ = [(pd.Timestamp(p["date"]), p["best"]) for lst in h.values() for p in lst if p["id"] in full
+              and not (e in STD_COMP_IMPL and p.get("impl") and abs(float(p["impl"]) - STD_COMP_IMPL[e]) > 1e-6)]
+        for sid in simple:
+            S_ = sorted([(pd.Timestamp(p["date"]), p["best"]) for lst in h.values() for p in lst if p["id"] == sid and
+                         not (e in STD_COMP_IMPL and p.get("impl") and abs(float(p["impl"]) - STD_COMP_IMPL[e]) > 1e-6)])
+            if not S_:
+                continue
+            rat = []
+            for d_s, v_s in S_:
+                near = sorted((abs((d_f - d_s).days), v_f) for d_f, v_f in F_ if abs((d_f - d_s).days) <= window_days)
+                if near:
+                    rat.append(v_s / near[0][1])
+            med = float(np.median(rat)) if rat else None
+            last_d, last_v = S_[-1]
+            est = last_v / med if (med and len(rat) >= 2) else None
+            rows.append(dict(event=e, exercise=CAT[sid].name, pairs=len(rat), ratio=med, last_date=str(last_d.date()), last_value=last_v, estimate=est,
+                             pr=(float(current[e]) if current else None)))
+    return pd.DataFrame(rows, columns=["event", "exercise", "pairs", "ratio", "last_date", "last_value", "estimate", "pr"])
+
+
+# ═════════════════════════════ 9h. БЫСТРАЯ ЗАПИСЬ ТЕКСТОМ: «длина 6.85, ядро 14.20, присед 180х3» → позиции журнала ═════════════════════════════
+# Разбор — обычный код по таблице синонимов, не нейросеть: один и тот же текст всегда даёт один и тот же результат, и его можно проверить глазами в предпросмотре.
+# Правила (МОИ): «ядро/диск/копьё/длина/высота/шест» без уточнения = полные попытки (…_full); со словом «соревнование/старт» = соревновательная серия; «ядро назад/снизу» = тест
+# Нариманова (7,26 кг назад через голову); «… с места» = метание/прыжок с места; жим/присед/рывок — вес × повторы (× серии), одно число = один подход на 1 повторение.
+_NUM = r"\d+(?::\d+)?(?:[.,]\d+)?"
+_X = r"[хx×*]"
+_NB = r"(?<![\d.,:])"
+QUICK_ALIASES: List[Tuple[str, str]] = [
+    (r"(?:бросок\s+)?ядр\w*\s+(?:назад|снизу)(?:\s+(?:через\s+голову|назад))?", "ts_sp_back"),
+    (r"ядр\w*\s+(?:вперед\s+)?с\s+места|толч\w*\s+с\s+места", "sp_fwd_stand"),
+    (r"диск\w*\s+с\s+места", "dt_stand"),
+    (r"тройн\w*(?:\s+прыжок)?(?:\s+с\s+места)?", "ts_triple"),
+    (r"прыж\w*\s+с\s+места|длин\w*\s+с\s+места", "ts_sj"),
+    (_NB + r"30\s*м?\s*с\s+ход\w*", "ts_fly30"),
+    (r"ядр\w*\s+(?:соревнов\w*|старт\w*)", "sp_comp"), (r"ядр\w*", "sp_full"),
+    (r"диск\w*\s+(?:соревнов\w*|старт\w*)", "dt_comp"), (r"диск\w*", "dt_full"),
+    (r"копь\w*\s+(?:соревнов\w*|старт\w*)", "jt_comp"), (r"копь\w*", "jt_full"),
+    (r"(?:прыж\w*\s+в\s+)?длин\w*\s+(?:соревнов\w*|старт\w*)", "lj_comp"), (r"(?:прыж\w*\s+в\s+)?длин\w*", "lj_full"),
+    (r"высот\w*", "hj_full"), (r"шест\w*", "pv_full"),
+    (_NB + r"110\s*м?\s*(?:с\s*/\s*б|мб|б)\b|барьер\w*\s*110", "h_110"),
+    (_NB + r"1500(?!\d)\s*м?", "en_1500"), (_NB + r"1000(?!\d)\s*м?", "en_test1000"), (_NB + r"400(?!\d)\s*м?", "se_400"), (_NB + r"100(?!\d)\s*м?", "ts_100"),
+    (r"жим\w*", "st_bench"), (r"присед\w*|присел\w*", "st_squat_h"), (r"рыв\w*", "st_snatch"), (r"подрыв\w*|взяти\w*", "st_clean"), (r"станов\w*|тяг\w*", "st_dead"),
+]
+QUICK_COMPILED = [(re.compile(p), i) for p, i in QUICK_ALIASES]
+
+
+def parse_quick(text: str) -> dict:
+    """Текст → {'items': [позиции журнала], 'lines': [читаемые строки предпросмотра], 'warnings': [...], 'unparsed': [...], 'date_word': 'сегодня'|'вчера'|None}.
+    Позиция: id, sets, reps, size, [impl], res. Значения вне физически возможных пропускаются с предупреждением."""
+    raw = str(text or "").lower().replace("ё", "е")
+    date_word = None
+    for w in ("позавчера", "вчера", "сегодня"):
+        if w in raw:
+            date_word = date_word or w
+            raw = raw.replace(w, " ")
+    segs = [x.strip(" .:-—") for x in re.split(r"[;\n]|,\s+|,(?=\D)|\s+и\s+", raw) if x.strip(" .:-—")]
+    items: List[dict] = []
+    lines: List[str] = []
+    warns: List[str] = []
+    unparsed: List[str] = []
+    for seg in segs:
+        best = None
+        for rx, iid in QUICK_COMPILED:
+            m = rx.search(seg)
+            if m and (best is None or m.start() < best[0].start()):
+                best = (m, iid)
+        if best is None:
+            unparsed.append(seg)
+            continue
+        m, iid = best
+        c = CAT[iid]
+        rest = (seg[:m.start()] + " " + seg[m.end():]).strip()
+        impl = IMPL_STD.get(iid)
+        mk = re.search(r"(" + _NUM + r")\s*кг", rest) if c.cat in ("Ядро", "Диск", "Копьё", "Контроль") and not c.id.startswith("st_") else None
+        if mk:
+            impl = float(mk.group(1).replace(",", "."))
+            rest = rest[:mk.start()] + " " + rest[mk.end():]
+        sp = res_spec(c)
+        if sp:
+            vals = parse_results(" ".join(re.findall(_NUM, rest)))
+            if not vals:
+                warns.append(f"«{seg}»: не нашёл числа — упражнение «{c.name}» пропущено.")
+                continue
+            it = dict(id=iid, sets=1, reps=max(1, len(vals)), size=c.size, res=[])
+            if impl:
+                it["impl"] = impl
+            ok_v = [v for v in vals if _sane(c, it, sp[0], sp[1], v)]
+            bad = [v for v in vals if v not in ok_v]
+            if bad:
+                warns.append(f"«{seg}»: значение {', '.join(f'{v:g}' for v in bad)} {sp[1]} вне допустимого диапазона для «{c.name}»"
+                             + (" (время на длинные дистанции пишите как 4:40)" if sp[0] == "time" and (c.size or 0) >= 400 else "") + " — пропущено.")
+            if not ok_v:
+                continue
+            it["res"], it["reps"] = ok_v, len(ok_v)
+            items.append(it)
+            lines.append(f"{c.name}: " + " ".join(fmt_res(sp[0], v) for v in ok_v) + f" {sp[1]}" + (f" (снаряд {impl:g} кг)" if impl and impl != IMPL_STD.get(iid) else ""))
+        else:
+            mm = re.search(r"(" + _NUM + r")\s*(?:кг)?\s*" + _X + r"\s*(\d+)(?:\s*" + _X + r"\s*(\d+))?", rest)
+            if mm:
+                w_, reps_, sets_ = float(mm.group(1).replace(",", ".")), int(mm.group(2)), int(mm.group(3) or 1)
+            else:
+                nums = re.findall(_NUM, rest)
+                if not nums:
+                    warns.append(f"«{seg}»: не нашёл вес — «{c.name}» пропущено.")
+                    continue
+                w_, reps_, sets_ = float(nums[0].replace(",", ".")), 1, 1
+            if not (5.0 <= w_ <= 400.0) or reps_ > 60 or sets_ > 30:
+                warns.append(f"«{seg}»: вес {w_:g} кг или повторы вне допустимого диапазона — пропущено.")
+                continue
+            items.append(dict(id=iid, sets=sets_, reps=reps_, size=w_))
+            lines.append(f"{c.name}: {w_:g} кг × {reps_}" + (f" × {sets_} сер." if sets_ > 1 else " (1 подход)"))
+    return dict(items=items, lines=lines, warnings=warns, unparsed=unparsed, date_word=date_word)
+
+
+# ═════════════════════════════ 9g. ПОТЕНЦИАЛ: тесты СФП из журнала → слабое звено → акценты; рост к старту ═════════════════════════════
+# Что здесь из источников, а что моё.
+#  • ИЗ ИСТОЧНИКОВ: уровни тестов по сумме очков — таблица Нариманова (NAR); нормы роста за сезон — Хейнла (LIT_HEINLA, heinla_cap);
+#    динамика тестов за подготовительный период — Грузенкин (GRZ_TEST_DYN, средняя группа мастеров спорта СССР, 7859 очк.).
+#  • МОЁ: профиль «7500» (REF_PROFILE); перевод «уровня» в очки вида через этот профиль; пороги ±500 («сила»/«техника»); множители акцентов;
+#    линейная зависимость роста от доли времени, когда вы тренировались; распределение роста по видам пропорционально запасу; оценка 1ПМ по формуле Эпли
+#    (общепринятая формула силовой подготовки, не из источников проекта). Всё это ориентиры для решений, а не измерения и не предсказания.
+REF_PROFILE = {"100m": 11.32, "LJ": 7.13, "SP": 13.70, "HJ": 1.96, "400m": 50.90, "110mH": 15.20, "DT": 41.80, "PV": 4.40, "JT": 56.80, "1500m": 283.0}
+
+# Тест Нариманова → (позиции каталога, подпись, кому «принадлежит»: группа плана и виды)
+SFP_TESTS = {
+    "shot_bwd": dict(ids=("ts_sp_back", "sp_back"), label="Бросок ядра назад (снизу через голову), м", group="strength", events=("SP", "DT", "JT"), impl=7.26),
+    "triple_sj": dict(ids=("ts_triple", "lj_triple_st"), label="Тройной с места, м", group="LJ", events=("LJ",)),
+    "vmax": dict(ids=("ts_fly30",), label="Vmax, м/с (30 м с хода: 30 / время)", group="sprint", events=("100m", "110mH")),
+    "t1000": dict(ids=("en_test1000",), label="Бег 1000 м, с", group="endurance", events=("1500m",)),
+    "bench": dict(ids=("st_bench",), label="Жим лёжа, кг (оценка 1ПМ по Эпли)", group="strength", events=("SP", "JT")),
+}
+# Динамика за подготовительный период (Грузенкин, средняя группа МС СССР): начало → конец (для времени ниже = лучше)
+THROW_TESTS = {
+    "stand_put": dict(ids=("sp_fwd_stand", "sp_stand"), label="Толчок ядра с места, м", event="SP", impl=7.26),
+    "stand_dt": dict(ids=("ts_dt_stand", "dt_stand_full", "dt_stand"), label="Бросок диска с места, м", event="DT", impl=2.0),
+}
+GRZ_TEST_DYN = {"shot_bwd": (15.18, 15.99), "triple_sj": (9.07, 9.45), "bench": (106.8, 119.6), "fly30": (3.16, 3.06), "snatch": (80.3, 87.2)}
+WEAK_GAP = 500.0       # МОЁ: на сколько очков уровень теста должен отличаться от уровня результата, чтобы считать разницу значимой
+
+
+def epley_1rm(weight: float, reps: float) -> float:
+    return float(weight) if reps <= 1 else float(weight) * (1.0 + float(reps) / 30.0)
+
+
+def tests_from_journal(log: Sequence[dict], today=None, window_days: int = 120) -> Dict[str, dict]:
+    """Последние лучшие значения тестов Нариманова из журнала за `window_days` дней: {тест: {value, date, source, n}}.
+    Ядро — только стандартным весом 7,26 кг (иначе сравнение с таблицей некорректно); Vmax — из 30 м с хода как 30/время; жим — оценка 1ПМ по Эпли."""
+    out: Dict[str, dict] = {}
+    t0 = pd.Timestamp(today).normalize() if today is not None else None
+    for e in sorted(log, key=lambda x: x["date"]):
+        d = pd.Timestamp(e["date"])
+        if t0 is not None and (d > t0 or (t0 - d).days > window_days):
+            continue
+        for it in (e.get("items") or []):
+            iid = it.get("id")
+            for tk, sp in {**SFP_TESTS, **THROW_TESTS}.items():
+                if iid not in sp["ids"]:
+                    continue
+                vals = [float(v) for v in (it.get("res") or []) if v is not None]
+                if tk in THROW_TESTS:
+                    w = it.get("impl")
+                    if w is not None and abs(float(w) - sp["impl"]) > 0.25:
+                        continue
+                    lim = (6.0, 22.0) if tk == "stand_put" else (15.0, 65.0)
+                    vals = [x for x in vals if lim[0] <= x <= lim[1]]
+                    if not vals:
+                        continue
+                    v, better = max(vals), (lambda a, b: a > b)
+                elif tk == "bench":
+                    if not it.get("size") or float(it["size"]) <= 0:
+                        continue
+                    v = epley_1rm(float(it["size"]), float(it.get("reps") or 1))
+                    better = lambda a, b: a > b
+                elif tk == "shot_bwd":
+                    w = it.get("impl")
+                    if w is not None and abs(float(w) - sp["impl"]) > 0.25:
+                        continue
+                    vals = [x for x in vals if 5.0 <= x <= 22.0]
+                    if not vals:
+                        continue
+                    v, better = max(vals), (lambda a, b: a > b)
+                elif tk == "triple_sj":
+                    vals = [x for x in vals if 5.0 <= x <= 11.5]
+                    if not vals:
+                        continue
+                    v, better = max(vals), (lambda a, b: a > b)
+                elif tk == "vmax":
+                    if float(it.get("size") or 30) != 30.0:
+                        continue
+                    vals = [x for x in vals if 2.4 <= x <= 5.0]
+                    if not vals:
+                        continue
+                    v, better = 30.0 / min(vals), (lambda a, b: a > b)
+                else:                                  # t1000
+                    vals = [x for x in vals if 120.0 <= x <= 400.0]
+                    if not vals:
+                        continue
+                    v, better = min(vals), (lambda a, b: a < b)
+                cur = out.get(tk)
+                if cur is None or better(v, cur["value"]) or (not better(cur["value"], v) and e["date"] > cur["date"]):
+                    out[tk] = dict(value=float(v), date=e["date"], source="журнал", n=(cur["n"] + 1 if cur else 1))
+                elif cur is not None:
+                    cur["n"] += 1
+    return out
+
+
+def event_level(event: str, result: float) -> float:
+    """«Уровень» вида в очках суммы: 7500 · очки / очки профиля 7500 (МОЁ определение; у профиля 7500 ровно 7500)."""
+    ref = float(wa_points(event, REF_PROFILE[event]))
+    return 7500.0 * float(wa_points(event, result)) / max(ref, 1e-9)
+
+
+def tests_assessment(tests: Dict[str, float], current: Dict[str, float]) -> pd.DataFrame:
+    """По каждому введённому тесту: уровень по таблице Нариманова, уровень связанных видов (среднее), разница и вывод.
+    Вывод: тест ниже результата на ≥ 500 → упираетесь в физическую базу (сила/СФП); выше на ≥ 500 → база есть, запас в технике/реализации."""
+    rows = []
+    for tk, sp in SFP_TESTS.items():
+        if tk not in tests or tests[tk] is None:
+            continue
+        v = float(tests[tk])
+        L_t = nar_level(tk, v)
+        L_e = float(np.mean([event_level(e, current[e]) for e in sp["events"]]))
+        gap = L_t - L_e
+        verdict = ("сила/СФП отстаёт от результата" if gap <= -WEAK_GAP else ("запас в технике и реализации" if gap >= WEAK_GAP else "соответствует результату"))
+        rows.append(dict(test=tk, label=sp["label"], value=v, level_test=L_t, level_events=L_e, gap=gap, verdict=verdict,
+                         events=",".join(sp["events"]), group=sp["group"]))
+    return pd.DataFrame(rows, columns=["test", "label", "value", "level_test", "level_events", "gap", "verdict", "events", "group"])
+
+
+def tests_emphasis(assess: pd.DataFrame, step: float = 0.05, lo: float = 0.9, hi: float = 1.25, fgap: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+    """Множители акцентов плана от слабых звеньев (МОЁ правило): тест ниже результата на ≥500 → +5 % группе, питающей тест (+5 % ещё при ≥1000);
+    тест выше результата на ≥500 → +5 % группам видов (техника/реализация). Пусто, если тестов нет."""
+    m: Dict[str, float] = {}
+    fgap = fgap or {}
+    if (assess is None or len(assess) == 0) and not fgap:
+        return m
+    for r in (assess.itertuples() if assess is not None else []):
+        if r.gap <= -WEAK_GAP:
+            k = 2 if r.gap <= -2 * WEAK_GAP else 1
+            m[r.group] = m.get(r.group, 1.0) * (1.0 + step * k)
+        elif r.gap >= WEAK_GAP:
+            for e in r.events.split(","):
+                g = e if e in ("SP", "DT", "JT", "LJ", "HJ", "PV") else None
+                if g and e not in fgap:                      # для видов с функцией по Грузенкину берём её
+                    m[g] = m.get(g, 1.0) * (1.0 + step)
+    for e, g in fgap.items():                                # тест выше результата на ≥ 50 очков → техника этого вида; ниже на ≥ 50 → сила
+        if g >= WEAK_GAP / 10.0:
+            m[e] = m.get(e, 1.0) * (1.0 + step)
+        elif g <= -WEAK_GAP / 10.0:
+            m["strength"] = m.get("strength", 1.0) * (1.0 + step)
+    return {g: round(float(np.clip(v, lo, hi)), 4) for g, v in m.items()}
+
+
+def apply_emphasis(base: Dict[str, float], mult: Dict[str, float], lo: float = 0.9, hi: float = 1.25, step: float = 0.05) -> Dict[str, float]:
+    out = dict(base)
+    for g, m in (mult or {}).items():
+        if g in out:
+            out[g] = round(round(float(np.clip(out[g] * m, lo, hi)) / step) * step, 4)
+    return out
+
+
+def growth_forecast(current: Dict[str, float], horizon_days: int, pause_days: int = 0, plan_share: float = 1.0, loss: float = 295.0,
+                    stretch: Optional[Dict[str, float]] = None, assess: Optional[pd.DataFrame] = None, fgap: Optional[Dict[str, float]] = None) -> dict:
+    """Ожидаемый рост личных результатов к старту и его распределение по видам.
+    ВЕЛИЧИНА — норма Хейнлы для вашего класса, пересчитанная на срок (heinla_cap), умноженная на долю времени, когда вы тренировались
+    ((срок − пауза)/срок · доля плана) — линейность МОЯ. РАСПРЕДЕЛЕНИЕ — пропорционально запасу до «потолка» (STRETCH, мои допущения); у видов, где тест
+    показывает запас в технике, вес ×1,15, где сила отстаёт — ×0,85 (МОЁ). Рост вида не превышает его запас."""
+    st_ = {**STRETCH, **(stretch or {})}
+    pts0 = {e: float(wa_points(e, current[e])) for e in EVENTS}
+    reserve = {e: max(float(wa_points(e, st_[e])) - pts0[e], 0.0) for e in EVENTS}
+    sum_pr = float(sum(np.floor(list(wa_points_vec(current).values()))))
+    lo_c, hi_c = heinla_cap(sum_pr, max(horizon_days, 0) / 365.0)
+    share = float(np.clip((max(horizon_days - pause_days, 0) / max(horizon_days, 1)) * plan_share, 0.0, 1.0))
+    w = {e: reserve[e] for e in EVENTS}
+    fgap = fgap or {}
+    if assess is not None and len(assess):
+        for r in assess.itertuples():
+            f = 1.15 if r.gap >= WEAK_GAP else (0.85 if r.gap <= -WEAK_GAP else 1.0)
+            for e in r.events.split(","):
+                if e not in fgap:                                 # для видов с функцией по Грузенкину берём её, а не уровень по Нариманову
+                    w[e] *= f
+    for e, g in fgap.items():
+        w[e] *= 1.15 if g >= WEAK_GAP / 10.0 else (0.85 if g <= -WEAK_GAP / 10.0 else 1.0)       # порог 50 очков на вид — тот же 500 «уровня», деленный на 10 видов (МОЁ)
+    out = {}
+    for tag, total in (("lo", lo_c * share), ("hi", hi_c * share)):
+        gain = {e: 0.0 for e in EVENTS}
+        left = total
+        free = {e for e in EVENTS if reserve[e] > 0}
+        for _ in range(6):
+            sw = sum(w[e] for e in free)
+            if left <= 1e-9 or sw <= 0:
+                break
+            for e in list(free):
+                add = left * w[e] / sw
+                room = reserve[e] - gain[e]
+                gain[e] += min(add, room)
+            left = total - sum(gain.values())
+            free = {e for e in free if reserve[e] - gain[e] > 1e-9}
+        out[tag] = gain
+    rows = []
+    for e in EVENTS:
+        rows.append(dict(event=e, current=float(current[e]), pts_now=int(np.floor(pts0[e])), reserve=round(reserve[e]), gain_lo=round(out["lo"][e], 1), gain_hi=round(out["hi"][e], 1),
+                         result_lo=float(wa_result(e, pts0[e] + out["lo"][e])), result_hi=float(wa_result(e, pts0[e] + out["hi"][e])), stretch=float(st_[e])))
+    tab = pd.DataFrame(rows)
+    return dict(table=tab, budget=(lo_c, hi_c), share=share, sum_pr=sum_pr, sum_lo=sum_pr + lo_c * share, sum_hi=sum_pr + hi_c * share,
+                tour_lo=sum_pr + lo_c * share - loss, tour_hi=sum_pr + hi_c * share - loss, loss=loss)
+
+
+def wa_points_vec(current: Dict[str, float]) -> Dict[str, float]:
+    return {e: float(wa_points(e, current[e])) for e in EVENTS}
+
+
+# ───────────── Грузенкин (автореферат, 1990): функция «тест → результат вида» ─────────────
+# Табл. 1 (динамика показателей, мастера спорта СССР, эксперимент окт.1987 – сент.1988). Колонки: лучший до эксперимента, исходный (начало подготовительного периода),
+# итоговый (конец подготовительного периода), лучший за период эксперимента. Единицы — как в таблице (см, кг, с).
+GRZ_T1 = {"snatch_kg": (82.6, 80.3, 87.2, 87.6), "bench_kg": (113.7, 106.8, 119.6, 120.8), "bwd_cm": (1570.3, 1518.3, 1599.2, 1604.0),
+          "stand_put_cm": (1321.5, 1282.4, 1345.2, 1358.0), "stand_dt_cm": (3783.0, 3685.0, 3833.7, 3933.0), "triple_cm": (930.7, 907.1, 944.7, 959.7),
+          "stand_lj_cm": (307.6, 294.0, 306.6, 312.0), "fly30_s": (3.09, 3.16, 3.06, 3.02)}
+# Табл. 4 (личные рекорды ДО эксперимента → лучшие результаты 1988 г.), 6 спортсменов. Суммы очков сверены с табл. 5: среднее 7647,5 → 7859,0, прирост +211,5.
+GRZ_T4 = {"SP": [(11.37, 12.54), (13.79, 14.31), (15.96, 16.38), (14.83, 15.82), (13.98, 14.56), (13.98, 14.34)],
+          "DT": [(39.18, 41.74), (41.70, 44.22), (49.98, 49.86), (42.48, 47.12), (40.52, 41.74), (41.42, 42.40)],
+          "JT": [(51.20, 54.12), (58.86, 59.18), (56.50, 57.12), (55.74, 57.00), (57.52, 58.12), (55.52, 57.02)],
+          "LJ_cm": [(727, 713), (724, 726), (697, 702), (718, 710), (666, 681), (716, 708)],
+          "sum": [(7637, 7989), (7852, 7922), (7735, 7916), (7756, 7878), (7400, 7756), (7505, 7693)]}
+# пары «вид ↔ тест»: (вид, ключ в GRZ_T1, перевод теста в метры). «Лучший против лучшего»: рекорд до эксперимента ↔ лучший тест до; лучший 1988 ↔ лучший тест за эксперимент.
+GRZ_COUPLE = {"SP_bwd": ("SP", "bwd_cm", 0.01, "shot_bwd"), "SP_stand": ("SP", "stand_put_cm", 0.01, "stand_put"), "DT_stand": ("DT", "stand_dt_cm", 0.01, "stand_dt")}
+GRZ_BAND = 0.04     # МОЁ: минимальная полуширина коридора вокруг среднего отношения (по двум точкам и шести спортсменам выборочный разброс не оценить)
+
+
+def grz_ratios() -> pd.DataFrame:
+    """Отношения «результат вида / тест» по группе Грузенкина: до эксперимента и после (лучший против лучшего), среднее, коридор.
+    Это групповые средние шести–восьми мастеров (7647 → 7859), а не индивидуальные зависимости: годится как ориентир «что в тестах должно соответствовать результату»."""
+    rows = []
+    for k, (ev, tk, sc, test) in GRZ_COUPLE.items():
+        a = np.array(GRZ_T4[ev], float)
+        r1 = float(a[:, 0].mean()) / (GRZ_T1[tk][0] * sc)
+        r2 = float(a[:, 1].mean()) / (GRZ_T1[tk][3] * sc)
+        m = (r1 + r2) / 2.0
+        lo, hi = min(r1, r2, m * (1 - GRZ_BAND)), max(r1, r2, m * (1 + GRZ_BAND))
+        rows.append(dict(pair=k, event=ev, test=test, ratio_before=r1, ratio_after=r2, ratio=m, lo=lo, hi=hi))
+    return pd.DataFrame(rows)
+
+
+def expected_from_test(pair: str, value: float) -> Tuple[float, float, float]:
+    """Ожидаемый результат вида (м) при значении теста: (низ, середина, верх) по группе Грузенкина."""
+    r = grz_ratios().set_index("pair").loc[pair]
+    return float(r.lo * value), float(r.ratio * value), float(r.hi * value)
+
+
+def tests_to_results(tests: Dict[str, float], current: Dict[str, float]) -> pd.DataFrame:
+    """Для каждого введённого метательного теста: ожидаемый результат вида, ваш результат и разница в метрах и очках.
+    Разница > 0: результат ниже, чем «поддерживает» тест (резерв в технике/реализации); < 0: результат выше теста (упираетесь в силу)."""
+    R = grz_ratios().set_index("pair")
+    rows = []
+    for k, (ev, tk, sc, test) in GRZ_COUPLE.items():
+        if test not in tests or tests[test] is None:
+            continue
+        lo, mid, hi = expected_from_test(k, float(tests[test]))
+        cur = float(current[ev])
+        rows.append(dict(pair=k, event=ev, test=test, value=float(tests[test]), exp_lo=lo, exp_mid=mid, exp_hi=hi, current=cur, d_m=mid - cur,
+                         d_pts=float(wa_points(ev, mid)) - float(wa_points(ev, cur)), ratio=float(R.loc[k, "ratio"])))
+    return pd.DataFrame(rows, columns=["pair", "event", "test", "value", "exp_lo", "exp_mid", "exp_hi", "current", "d_m", "d_pts", "ratio"])
+
+
+def function_gaps(tr: pd.DataFrame) -> Dict[str, float]:
+    """Разница в очках «ожидание по тесту − ваш результат» по видам (среднее, если тестов несколько)."""
+    if tr is None or len(tr) == 0:
+        return {}
+    return {e: float(g.d_pts.mean()) for e, g in tr.groupby("event")}
+
+
+
+def test_targets(tests: Dict[str, float], today, prep_start, prep_end, dates: Sequence) -> pd.DataFrame:
+    """Ориентиры тестов на контрольные дни: линейный рост от сегодня до конца подготовительного периода на ту долю, на какую выросла средняя группа Грузенкина
+    (ядро назад +5,3 %, тройной +4,2 %, жим +12 %, Vmax +3,3 %). Группа сильнее вас — для вас это ориентир, не норма (МОЁ допущение о линейности и переносе)."""
+    pct = {"shot_bwd": GRZ_TEST_DYN["shot_bwd"][1] / GRZ_TEST_DYN["shot_bwd"][0] - 1, "triple_sj": GRZ_TEST_DYN["triple_sj"][1] / GRZ_TEST_DYN["triple_sj"][0] - 1,
+           "bench": GRZ_TEST_DYN["bench"][1] / GRZ_TEST_DYN["bench"][0] - 1, "vmax": GRZ_TEST_DYN["fly30"][0] / GRZ_TEST_DYN["fly30"][1] - 1}
+    t0, t1 = pd.Timestamp(prep_start).normalize(), pd.Timestamp(prep_end).normalize()
+    rows = []
+    for tk, p in pct.items():
+        if tk not in tests or tests[tk] is None:
+            continue
+        for d in dates:
+            d = pd.Timestamp(d).normalize()
+            f = float(np.clip((d - t0).days / max((t1 - t0).days, 1), 0.0, 1.0))
+            rows.append(dict(test=tk, label=SFP_TESTS[tk]["label"], date=str(d.date()), target=float(tests[tk]) * (1.0 + p * f), now=float(tests[tk])))
+    return pd.DataFrame(rows, columns=["test", "label", "date", "target", "now"])
+
+
+def quick_selftest():
+    r = parse_quick("Сегодня длина 6.85, ядро 14.20")
+    assert [(i["id"], i["res"]) for i in r["items"]] == [("lj_full", [6.85]), ("sp_full", [14.2])] and r["date_word"] == "сегодня" and not r["warnings"]
+    r = parse_quick("ядро снизу 14,5, диск с места 33, ядро с места 13")
+    assert [(i["id"], i["res"]) for i in r["items"]] == [("ts_sp_back", [14.5]), ("dt_stand", [33.0]), ("sp_fwd_stand", [13.0])], "десятичная запятая и слова «снизу/с места»"
+    r = parse_quick("присед 180х3, жим 100, рывок 80х2х3")
+    assert [(i["id"], i["sets"], i["reps"], i["size"]) for i in r["items"]] == [("st_squat_h", 1, 3, 180.0), ("st_bench", 1, 1, 100.0), ("st_snatch", 3, 2, 80.0)]
+    r = parse_quick("100 м 11.2, 400 м 51.8, 110 с/б 15.1, 1500 м 4:40.5, 1000 м 2:50, 30 м с хода 3.05 3.08")
+    assert [i["id"] for i in r["items"]] == ["ts_100", "se_400", "h_110", "en_1500", "en_test1000", "ts_fly30"] and r["items"][3]["res"] == [280.5] and r["items"][5]["res"] == [3.05, 3.08]
+    r = parse_quick("длина 68.5, бла 5, 1500 м 4.40")
+    assert not r["items"] and len(r["warnings"]) == 2 and r["unparsed"] == ["бла 5"], "ошибки ввода не попадают в журнал"
+    r = parse_quick("ядро 6 кг 14.5 14.8")
+    assert r["items"][0]["impl"] == 6.0 and r["items"][0]["res"] == [14.5, 14.8] and r["items"][0]["reps"] == 2
+    assert parse_quick("")["items"] == [] and parse_quick("присед")["items"] == []
+    # результат разбора читается журналом: тесты и кандидаты в личные
+    lg = [dict(date="2026-10-10", items=parse_quick("ядро снизу 14.5, диск с места 33, жим 100х3")["items"])]
+    tj = tests_from_journal(lg, "2026-10-12")
+    assert tj["shot_bwd"]["value"] == 14.5 and tj["stand_dt"]["value"] == 33.0 and abs(tj["bench"]["value"] - 110.0) < 1e-9
+
+
+def potential_selftest():
+    cur = samandyk().current
+    # функция «тест → результат» по Грузенкину
+    gr = grz_ratios().set_index("pair")
+    assert abs(np.mean(GRZ_T4["sum"], axis=0)[0] - 7647.5) < 1e-9 and abs(np.mean(GRZ_T4["sum"], axis=0)[1] - 7859.0) < 1e-9, "суммы табл. 4 = табл. 5"
+    assert 0.88 < gr.loc["SP_bwd", "ratio"] < 0.93 and 1.05 < gr.loc["SP_stand", "ratio"] < 1.10 and 1.10 < gr.loc["DT_stand", "ratio"] < 1.17
+    assert (gr.lo < gr.ratio).all() and (gr.hi > gr.ratio).all() and (gr.lo <= gr[["ratio_before", "ratio_after"]].min(axis=1) + 1e-12).all()
+    lo_, mid_, hi_ = expected_from_test("DT_stand", 33.0)
+    assert 35.0 < lo_ < mid_ < hi_ < 39.5, (lo_, mid_, hi_)
+    tr = tests_to_results({"shot_bwd": 14.5, "stand_dt": 33.0}, cur)
+    assert set(tr.pair) == {"SP_bwd", "DT_stand"} and (tr.d_m > 0).all() and (tr.d_pts > 0).all(), "тесты выше результатов → резерв"
+    assert tests_to_results({}, cur).empty and function_gaps(tests_to_results({}, cur)) == {}
+    fg = function_gaps(tr)
+    assert fg["DT"] > 25 and fg["SP"] > 0
+    g_f = growth_forecast(cur, 237, fgap={"DT": 200.0}); g_n = growth_forecast(cur, 237, fgap={"DT": -200.0})
+    assert g_f["table"].set_index("event").loc["DT", "gain_hi"] >= g_n["table"].set_index("event").loc["DT", "gain_hi"]
+    lj_ = [dict(date="2026-10-05", items=[dict(id="dt_stand", res=[33.0], impl=2.0), dict(id="sp_fwd_stand", res=[13.0], impl=7.26), dict(id="dt_stand", res=[31.0], impl=1.75)])]
+    tj_ = tests_from_journal(lj_, "2026-10-10")
+    assert tj_["stand_dt"]["value"] == 33.0 and tj_["stand_put"]["value"] == 13.0, "диск другого веса не подменяет стандартный"
+    g1 = growth_forecast(cur, 237)
+    lo, hi = heinla_cap(g1["sum_pr"], 237 / 365.0)
+    assert abs(g1["table"].gain_hi.sum() - hi) < 1.0 and abs(g1["table"].gain_lo.sum() - lo) < 1.0, "сумма роста = норма Хейнлы на срок"
+    assert (g1["table"].gain_hi <= g1["table"].reserve + 1e-6).all()
+    g2 = growth_forecast(cur, 237, pause_days=61)
+    assert abs(g2["table"].gain_hi.sum() / g1["table"].gain_hi.sum() - (237 - 61) / 237) < 0.02, "пауза уменьшает рост пропорционально"
+    g3 = growth_forecast(cur, 237, plan_share=0.5)
+    assert abs(g3["table"].gain_hi.sum() / g1["table"].gain_hi.sum() - 0.5) < 0.02
+    assert growth_forecast(cur, 237, pause_days=300)["table"].gain_hi.sum() == 0
+    # диск (самый большой запас) получает бо́льшую долю, чем длина (малый запас)
+    t = g1["table"].set_index("event")
+    assert t.loc["DT", "gain_hi"] > t.loc["LJ", "gain_hi"]
+    # тесты из журнала
+    lg = [dict(date="2026-10-05", items=[dict(id="ts_sp_back", sets=3, reps=3, size=None, res=[14.2, 14.5, 14.4]), dict(id="ts_triple", res=[9.1, 9.2]),
+                                        dict(id="ts_fly30", size=30, res=[3.05, 3.10]), dict(id="en_test1000", size=1000, res=[170.0]), dict(id="st_bench", sets=4, reps=6, size=90)]),
+          dict(date="2026-10-08", items=[dict(id="ts_sp_back", res=[12.0], impl=5.0)])]
+    tj = tests_from_journal(lg, "2026-10-10")
+    assert abs(tj["shot_bwd"]["value"] - 14.5) < 1e-9, "ядро другого веса не должно подменять стандартное"
+    assert abs(tj["bench"]["value"] - 108.0) < 1e-9 and abs(tj["vmax"]["value"] - 30 / 3.05) < 1e-9 and tj["t1000"]["value"] == 170.0 and tj["triple_sj"]["value"] == 9.2
+    assert tests_from_journal(lg, "2027-05-01") == {}, "тесты старше 120 дней не считаются текущими"
+    A = tests_assessment({k: v["value"] for k, v in tj.items()}, cur)
+    r = A.set_index("test")
+    assert abs(r.loc["shot_bwd", "level_test"] - nar_level("shot_bwd", 14.5)) < 1e-9 and len(A) == 5
+    assert tests_emphasis(pd.DataFrame(columns=A.columns)) == {} and apply_emphasis({"SP": 1.0}, {}) == {"SP": 1.0}
+    weak = tests_assessment({"shot_bwd": 13.0}, cur)
+    assert weak.iloc[0].gap < -WEAK_GAP and tests_emphasis(weak).get("strength", 1.0) > 1.0
+    strong = tests_assessment({"shot_bwd": 16.5}, cur)
+    assert strong.iloc[0].gap > WEAK_GAP and tests_emphasis(strong).get("SP", 1.0) > 1.0
+    assert growth_forecast(cur, 237, assess=strong)["table"].set_index("event").loc["SP", "gain_hi"] >= growth_forecast(cur, 237, assess=weak)["table"].set_index("event").loc["SP", "gain_hi"]
+    tt = test_targets({"shot_bwd": 14.5}, "2026-10-12", "2026-10-12", "2027-02-01", ["2026-12-23", "2027-02-17"])
+    assert tt.target.iloc[0] > 14.5 and abs(tt.target.iloc[1] - 14.5 * GRZ_TEST_DYN["shot_bwd"][1] / GRZ_TEST_DYN["shot_bwd"][0]) < 1e-9
+
+
 def live_selftest():
     cur = samandyk().current
     seq = list(pd.DataFrame({"s": TYPICAL_SEQ(120)}).s)
@@ -3058,6 +3624,29 @@ def live_selftest():
     H_ = {e: 30.0 for e in EVENTS}
     em_ = emphasis_hours_law(cur_, H_)
     assert all(0.9 <= v <= 1.25 for v in em_.values()) and abs(sum(optimal_hours(cur_, 300.0).values()) - 300.0) < 2.0
+    # прогноз после паузы в записях, точка отсчёта, кандидаты в рекорды, пары «с места → полный»
+    last_ = pd.Timestamp("2026-10-20")
+    ks_, ds_ = forecast_seq(df, last_, pd.Timestamp("2026-10-25"), with_dates=True)
+    assert ks_[:4] == ["S_REST"] * 4 and ds_[0] == pd.Timestamp("2026-10-21") and ds_[4] == pd.Timestamp("2026-10-25") and len(ks_) == 4 + int((df.date >= pd.Timestamp("2026-10-25")).sum())
+    assert forecast_seq(df, None, pd.Timestamp("2026-10-25"))[0] == df[df.date >= pd.Timestamp("2026-10-25")].session_key.iloc[0]
+    day_ = lambda d, its: dict(date=d, rest=False, items=its, groups={}, minutes=70, rpe=6.5)
+    mdl_ = PerfModel.from_prior()
+    st_a = analyze_log(log, df, pd.Timestamp("2026-11-01"), mdl_)["state"]
+    st_b = analyze_log(log + [day_("2026-11-01", [dict(id="st_squat_h", sets=3, reps=3, size=200)])], df, pd.Timestamp("2026-11-02"), mdl_)["state"]
+    sq_ = list(df[df.date >= pd.Timestamp("2026-11-02")].session_key)
+    fa_, fb_ = forecast_sum(cur_, 77.5, sq_, mdl_, st_a), forecast_sum(cur_, 77.5, sq_, mdl_, st_b)
+    assert abs(fa_ - fb_) < 8, f"одна тяжёлая тренировка за полгода до старта не должна двигать прогноз: {fa_:.0f} vs {fb_:.0f}"
+    pz_ = pause_scenario(df, pd.Timestamp("2026-11-02"), pd.Timestamp("2026-11-03"), 60, {"сем": pd.Timestamp("2027-02-01")}, cur_, 77.5, mdl_, st_a, pd.Timestamp("2026-11-01"))
+    pz2_ = pause_scenario(df, pd.Timestamp("2026-11-02"), pd.Timestamp("2026-12-03"), 60, {"сем": pd.Timestamp("2027-02-01")}, cur_, 77.5, mdl_, st_a, pd.Timestamp("2026-11-01"))
+    assert len(pz_) == 1 and pz_.delta.iloc[0] <= 0 and pz2_.delta.iloc[0] < pz_.delta.iloc[0], "пауза ближе к старту обязана стоить больше ранней"
+    assert len(pr_candidates([day_("2026-11-01", [dict(id="sp_full", sets=3, reps=5, impl=7.26, res=[13.0, 12.9])])], cur_)) == 1
+    assert len(pr_candidates([day_("2026-11-01", [dict(id="sp_full", sets=3, reps=5, impl=6.0, res=[14.5])])], cur_)) == 0          # не соревновательный снаряд
+    assert len(pr_candidates([day_("2026-11-01", [dict(id="dt_stand", sets=3, reps=5, impl=2.0, res=[33.0])])], cur_)) == 0         # с места ≠ полный вид
+    assert len(pr_candidates([day_("2026-11-01", [dict(id="sp_full", sets=3, reps=5, impl=7.26, res=[11.5])])], cur_)) == 0
+    pl_ = [day_(f"2026-11-{d:02d}", [dict(id="dt_stand", sets=3, reps=5, impl=2.0, res=[a_]), dict(id="dt_full", sets=3, reps=5, impl=2.0, res=[b_])]) for d, a_, b_ in ((1, 26.0, 30.0), (8, 27.0, 31.0), (15, 27.6, 32.0))]
+    pr_ = pair_ratio(pl_ + [day_("2026-11-20", [dict(id="dt_stand", sets=3, reps=5, impl=2.0, res=[33.0])])], cur_)
+    assert int(pr_.pairs.iloc[0]) == 3 and 0.85 < pr_.ratio.iloc[0] < 0.88 and pr_.estimate.iloc[0] > 33
+    assert pair_ratio([day_("2026-11-20", [dict(id="dt_stand", sets=3, reps=5, impl=2.0, res=[33.0])])], cur_).estimate.iloc[0] is None
     print("самопроверка live: данные → прогноз, модель → прогноз, цель → результаты, журнал → анализ и добор — пройдена")
 
 
@@ -4389,6 +4978,8 @@ def selftest():
     lit_selftest()
     grz_selftest()
     live_selftest()
+    potential_selftest()
+    quick_selftest()
 
 
 def run_library():
@@ -4511,23 +5102,21 @@ if __name__ == "__main__" and any(a.startswith("--mode") for a in sys.argv[1:]):
 
 
 # ═════════════════════════════ 11. STREAMLIT-ИНТЕРФЕЙС ═════════════════════════════
-"""
-Decathlon Suite — живое приложение для Самандыка Д.В.
-Запуск: streamlit run app.py     (рядом лежат decathlon_suite.py и season_plan.csv)
-
-Как это работает:
-  • меняете результаты / вес / даты / характеристики модели в боковой панели — всё пересчитывается сразу:
-    прогноз модели (decathlon_suite.py), Монте-Карло турнира, чувствительность, усадка профиля, нормы Хейнлы;
-  • вкладка «Цель → результаты» решает обратную задачу: задаёте нужную сумму — получаете, какие результаты нужны по видам;
-  • план берётся из season_plan.csv; если вы меняете даты или масштаб объёма — план строится заново (≈15 с, кэшируется).
-
-Что из источников, а что моё:
-  • очки 1985 г. и манежные формулы — проверены по протоколу Универсиады (5117);
-  • нормы Хейнлы (прирост за 2 сезона, потери 295±90), таблица Нариманова (КД-2), помесячная структура нагрузок и динамика тестов — Грузенкин (1990);
-    сочетания видов в день — Юшкевич/Романов (2012);
-  • МОИ допущения: «потолочные» результаты по видам (обратная задача), профили ≈7500/≈7850, пороги самочувствия, шлюзы модели,
-    стартовые параметры модели (середины диапазонов, K — заглушки, пока нет вашего журнала), недельная волна, поддерживающие занятия, тест-дни.
-"""
+# Decathlon Suite — живое приложение для Самандыка Д.В.
+# Запуск: streamlit run app.py     (рядом лежат decathlon_suite.py и season_plan.csv)
+#
+# Как это работает:
+#   • меняете результаты / вес / даты / характеристики модели в боковой панели — всё пересчитывается сразу:
+#     прогноз модели (decathlon_suite.py), Монте-Карло турнира, чувствительность, усадка профиля, нормы Хейнлы;
+#   • вкладка «Цель → результаты» решает обратную задачу: задаёте нужную сумму — получаете, какие результаты нужны по видам;
+#   • план берётся из season_plan.csv; если вы меняете даты или масштаб объёма — план строится заново (≈15 с, кэшируется).
+#
+# Что из источников, а что моё:
+#   • очки 1985 г. и манежные формулы — проверены по протоколу Универсиады (5117);
+#   • нормы Хейнлы (прирост за 2 сезона, потери 295±90), таблица Нариманова (КД-2), помесячная структура нагрузок и динамика тестов — Грузенкин (1990);
+#     сочетания видов в день — Юшкевич/Романов (2012);
+#   • МОИ допущения: «потолочные» результаты по видам (обратная задача), профили ≈7500/≈7850, пороги самочувствия, шлюзы модели,
+#     стартовые параметры модели (середины диапазонов, K — заглушки, пока нет вашего журнала), недельная волна, поддерживающие занятия, тест-дни.
 import os
 import sys
 import types
@@ -4622,14 +5211,42 @@ def load_state():
         return {}, "нет"
 
 
-def save_state(state):
-    """Пишет везде, где можно. Возвращает список мест, куда записалось."""
+try:
+    from zoneinfo import ZoneInfo
+    _TZ = ZoneInfo("Europe/Minsk")
+except Exception:  # noqa: BLE001
+    _TZ = _dt.timezone(_dt.timedelta(hours=3))
+
+
+def now_local():
+    """Время по Минску (сервер Streamlit Cloud живёт по UTC — без этого ночью «сегодня» было бы вчерашним днём)."""
+    return _dt.datetime.now(_TZ)
+
+
+def today_local():
+    return pd.Timestamp(now_local().date())
+
+
+def save_state(state, verify=False):
+    """Пишет везде, где можно. Возвращает список мест, куда записалось. verify=True: после записи в облако читает метку времени обратно
+    и сверяет — так «записано» значит «действительно лежит в облаке»."""
     ok = []
+    st.session_state.pop("_save_err", None)
     try:
         if _secret("SUPABASE_URL") and _secret("SUPABASE_KEY"):
             _sb_req("POST", "app_state?on_conflict=id", [{"id": STATE_ID, "data": state}],
                     {"Prefer": "resolution=merge-duplicates,return=minimal"})
-            ok.append("облако")
+            good = True
+            if verify and state.get("saved_at"):
+                try:
+                    back = _sb_req("GET", f"app_state?id=eq.{STATE_ID}&select=s:data->>saved_at")
+                    if not back or back[0].get("s") != state.get("saved_at"):
+                        good = False
+                        st.session_state["_save_err"] = "облако: запись не подтвердилась при чтении обратно"
+                except Exception:  # noqa: BLE001
+                    pass          # проверка не удалась технически — запись сама прошла
+            if good:
+                ok.append("облако")
     except Exception as exc:  # noqa: BLE001
         st.session_state["_save_err"] = f"облако: {exc}"
     try:
@@ -4661,7 +5278,7 @@ INIT = st.session_state["_init"]
 CUR_W = {}                                            # значения виджетов в этом прогоне
 
 
-def _mk(target, kind):
+def _mk(ns, kind):
     def inner(label, *a, **k):
         persist = k.pop("_save", True)
         key = k.pop("key", None) or "w:" + label
@@ -4679,7 +5296,7 @@ def _mk(target, kind):
                     k["value"] = sv
             except Exception:  # noqa: BLE001
                 pass
-        out = getattr(target, kind)(label, *a, key=key, **k)
+        out = getattr(ns.t, kind)(label, *a, key=key, **k)
         if persist:
             CUR_W[key] = out.isoformat() if isinstance(out, _dt.date) else (bool(out) if isinstance(out, (bool, np.bool_)) else (float(out) if isinstance(out, (float, np.floating)) else (int(out) if isinstance(out, (int, np.integer)) else out)))
         return out
@@ -4687,12 +5304,14 @@ def _mk(target, kind):
 
 
 class _Ns:
+    """Виджеты с сохранением значений. Куда рисовать — задаётся полем t (контейнер/вкладка); по умолчанию — текущее место в странице."""
     def __init__(self, target):
+        self.t = target
         for kind in ("number_input", "slider", "checkbox", "select_slider", "date_input"):
-            setattr(self, kind, _mk(target, kind))
+            setattr(self, kind, _mk(self, kind))
 
 
-P = _Ns(st.sidebar)       # виджеты боковой панели
+P = _Ns(st)               # настройки: перед каждым блоком ставится P.t = нужная вкладка раздела «Данные и модель»
 X = _Ns(st)               # виджеты внутри expander / вкладок
 
 
@@ -4701,7 +5320,7 @@ def persist_now():
     if CUR_W and json.dumps(CUR_W, sort_keys=True) != json.dumps(STATE.get("widgets", {}), sort_keys=True):
         new = dict(STATE)
         new["widgets"] = dict(CUR_W)
-        new["saved_at"] = _dt.datetime.now().isoformat(timespec="seconds")
+        new["saved_at"] = now_local().isoformat(timespec="seconds")
         where = save_state(new)
         st.session_state["_state"] = new
         st.session_state["_where"] = where
@@ -4709,21 +5328,58 @@ def persist_now():
         STATE.update(new)
 
 
+def commit(new, what):
+    """Записывает изменённое состояние и оставляет сообщение об итоге, которое переживёт перезапуск страницы (раньше после «Записать» не было видно ничего)."""
+    new = dict(new)
+    w_ = dict(STATE.get("widgets", {}))
+    w_.update(CUR_W)              # виджеты, созданные ниже по странице, в этом прогоне ещё не известны — не теряем их прежние значения
+    new["widgets"] = w_
+    new["saved_at"] = now_local().isoformat(timespec="seconds")
+    where = save_state(new, verify=True)
+    st.session_state["_where"] = where
+    st.session_state["_state"] = new
+    STATE.clear()
+    STATE.update(new)
+    t_ = now_local().strftime("%H:%M")
+    cloud_cfg = bool(_secret("SUPABASE_URL") and _secret("SUPABASE_KEY"))
+    err_ = st.session_state.get("_save_err", "")
+    if "облако" in where:
+        flash = ("success", f"✅ {what} · {t_} · лежит в облаке (проверено чтением обратно)")
+    elif where and cloud_cfg:
+        flash = ("warning", f"⚠️ {what} · {t_} · записано только на сервере: {err_ or 'облако не ответило'}. После перезапуска приложения запись может пропасть — "
+                            "скачайте копию (⚙️ Данные и модель → 💾 Копия данных).")
+    elif where:
+        flash = ("warning", f"⚠️ {what} · {t_} · записано на сервере, но облако не подключено: после перезапуска приложения запись пропадёт. "
+                            "Скачайте копию (⚙️ Данные и модель → 💾 Копия данных) или подключите облако (DEPLOY.md).")
+    else:
+        flash = ("error", f"❌ {what}: не удалось сохранить нигде. Скачайте копию (⚙️ Данные и модель → 💾 Копия данных) и сообщите об ошибке.")
+    st.session_state["_flash"] = flash
+    st.rerun()
+
+
+# ───────────────────────── каркас страницы ─────────────────────────
+# Пять разделов вместо тринадцати вкладок; ежедневное — «Сегодня», остальное — по смыслу. Старые номера вкладок (tabs[N]) сохранены как словарь.
+TOP = st.container()                                    # выбор дня и статус дня (заполняется ниже, когда известен план)
+SEC = st.tabs(["🏠 Сегодня", "📓 Дневник", "🗓 План", "🎯 Прогноз", "⚙️ Данные и модель"])
+with SEC[1]:
+    DIA = st.tabs(["Запись дня", "Нагрузка и форма", "История результатов"])
+with SEC[2]:
+    PLN = st.tabs(["Весь сезон", "Связи и часы"])
+with SEC[3]:
+    FC_TOP = st.container()                             # сводные показатели над вкладками прогноза
+    FC = st.tabs(["Прогноз модели", "Цель → результаты", "Нормы Хейнлы", "Семиборье", "Профили", "Тесты СФП"])
+with SEC[4]:
+    SET = st.tabs(["👤 Профиль", "📅 Календарь и объём", "🧠 Модель", "🔧 Правила плана", "ℹ️ Как это работает", "💾 Копия данных"])
+tabs = {0: SEC[0], 1: DIA[0], 2: DIA[1], 11: DIA[2], 3: PLN[0], 12: PLN[1], 4: FC[0], 5: FC[1], 6: FC[2], 7: FC[3], 8: FC[4], 9: FC[5], 10: SET[4]}
+SIDE_STATUS = st.sidebar.container()                   # статус сохранения (рисуется в самом конце, когда известен итог прогона)
+
 # ───────────────────────── боковая панель: данные ─────────────────────────
-sb = st.sidebar
-sb.header("👤 Самандык Д.В.")
-_where = st.session_state.get("_where")
-_src = st.session_state.get("_src")
-if _secret("SUPABASE_URL"):
-    sb.caption("💾 Облако подключено; изменения сохраняются автоматически." + (f" Последнее: {STATE.get('saved_at', '—')}" if STATE.get("saved_at") else ""))
-else:
-    sb.caption("💾 Сохранение в файл на сервере (на бесплатном Streamlit Cloud он стирается при перезапуске — подключите облако, см. DEPLOY.md, или делайте копию ниже)."
-               + (f" Загружено из: {_src}." if _src and _src != "нет" else ""))
-if st.session_state.get("_save_err"):
-    sb.warning("Не удалось записать в " + st.session_state["_save_err"])
-with sb.expander("🛟 Резервная копия данных"):
-    st.download_button("Скачать копию (JSON)", json.dumps(STATE, ensure_ascii=False, indent=1).encode("utf-8"), "athlete_state.json", "application/json")
-    _up = st.file_uploader("Загрузить копию", type="json", key="restore_up")
+# ── 💾 Копия данных
+with SET[5]:
+    st.subheader("💾 Копия данных")
+    st.caption("Всё (записи дневника, настройки, срезы результатов) лежит одним файлом. Копия — страховка на случай, если облако недоступно или вы меняете место запуска.")
+    st.download_button("⬇️ Скачать копию (JSON)", json.dumps(STATE, ensure_ascii=False, indent=1).encode("utf-8"), "athlete_state.json", "application/json")
+    _up = st.file_uploader("Загрузить копию (заменит текущие данные)", type="json", key="restore_up")
     if _up is not None:
         _raw = _up.getvalue()
         _h = hashlib.md5(_raw).hexdigest()
@@ -4738,6 +5394,13 @@ with sb.expander("🛟 Резервная копия данных"):
                 st.rerun()
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Не удалось прочитать копию: {exc}")
+_src = st.session_state.get("_src")
+
+# ── 👤 Профиль
+sb = SET[0]
+P.t = sb
+sb.subheader("👤 Самандык Д.В.")
+sb.caption("Эти значения сохраняются автоматически при каждом изменении. Результаты — ваши личные рекорды (от них считаются очки, прогноз и план).")
 ath_height = P.number_input("Рост (м)", value=1.85, step=0.01, help="Рост я не знаю — введите свой (нужен только для КД-2).")
 ath_mass = P.number_input("Вес (кг)", value=77.5, step=0.5)
 
@@ -4767,7 +5430,7 @@ hep = {"60m": P.number_input("60 м (с)", value=7.12, step=0.01),
        "1000m": P.number_input("1000 м (с)", value=167.0, step=1.0, help="2:47 = 167 с")}
 
 sb.subheader("Тесты СФП")
-has_tests = P.checkbox("Тесты замерены лично", value=False, help="Отметьте, только если это ваши реальные замеры.")
+has_tests = P.checkbox("Тесты замерены лично", value=False, help="Отметьте, только если это ваши реальные замеры. Замеры, внесённые в журнал («Тест: …» в «Контроль», «Жим лёжа»), подхватываются сами и имеют приоритет.")
 v_max = P.number_input("Vmax (м/с)", value=10.40, step=0.05)
 t_triple = P.number_input("Тройной с места (м)", value=9.40, step=0.05)
 t_shot = P.number_input("Бросок ядра назад (м)", value=14.50, step=0.1)
@@ -4775,7 +5438,9 @@ t_bench = P.number_input("Жим лёжа (кг)", value=110.0, step=2.5)
 t_1000 = P.number_input("Бег 1000 м (с)", value=167.0, step=1.0)
 
 # ───────────────────────── боковая панель: характеристики модели ─────────────────────────
-sb.header("🧠 Характеристики модели")
+sb = SET[2]
+P.t = sb
+sb.subheader("🧠 Характеристики модели")
 sb.caption("Стартовые значения — середины диапазонов из ТЗ. Пока нет вашего журнала, это не измерено, а заложено: двигайте и смотрите, что меняется.")
 with sb.expander("Полураспад утомления (часы)", expanded=False):
     h_cns = X.slider("ЦНС (диапазон ТЗ 24–48)", 12.0, 72.0, 36.0, 1.0)
@@ -4792,12 +5457,18 @@ sims = P.select_slider("Розыгрышей Монте-Карло", options=[10
 loss_n = P.slider("Потери «сумма личных − турнир» (Хейнла: 295±90)", 150, 450, 295, 5)
 
 # ───────────────────────── боковая панель: даты и план ─────────────────────────
-sb.header("📅 Календарь и план")
+sb = SET[1]
+P.t = sb
+sb.subheader("📅 Календарь и объём")
 d_start = pd.Timestamp(P.date_input("Начало плана", value=DEF_START.date()))
 d_hept = pd.Timestamp(P.date_input("Семиборье (старт)", value=DEF_HEPT.date()))
 d_dec = pd.Timestamp(P.date_input("Десятиборье (старт)", value=DEF_DEC.date()))
 vol_scale = P.slider("Масштаб объёма к Грузенкину", 0.6, 1.3, 1.0, 0.05,
                       help="1.0 = годовые объёмы средней группы мастеров спорта СССР. Для вас могут быть тяжелее или легче.")
+sb = SET[3]
+P.t = sb
+sb.subheader("🔧 Правила адаптации плана")
+sb.caption("Как план подстраивается под ваши результаты и записи. Все правила — мои допущения (в подсказках «?» указано, что из литературы, а что моё).")
 indiv = P.slider("Индивидуализация плана по моим результатам", 0.0, 1.5, 1.0, 0.1,
                  help="0 = чистый план Грузенкина для средней группы. Больше = больше занятий и объёма для средств, питающих виды с наибольшим запасом роста "
                       "(очки до «потолка»), и меньше для сильных видов. Правило моё, не из источника.")
@@ -4813,10 +5484,28 @@ corr_label = P.select_slider("Связи между видами в Монте-�
                              help="Корреляции результатов между видами в турнирном розыгрыше. Синтез = обратно-дисперсионное усреднение в z-пространстве Фишера (веса — на вкладке «Связи и часы»).")
 w_hours = P.slider("Вес закона убывающей отдачи в индивидуализации", 0.0, 1.0, 0.5, 0.1,
                    help="Смешивает «запас роста» с законом убывающей отдачи (Юшкевич, Романов 2012): форма из статьи (показатель ≈0,47), масштаб — ваши «потолки». 0 = только запас роста.")
+use_tests_emph = P.checkbox("Слабое звено по тестам СФП влияет на акценты плана", value=True,
+                            help="Если тест ниже результата соответствующих видов на ≥ 500 очков по таблице Нариманова — группе, питающей тест, +5 % (при ≥ 1000 — +10 %); "
+                                 "если выше на ≥ 500 — +5 % техническим группам этих видов. Работает только при наличии тестов (из журнала или профиля). Правило и пороги мои, не из источника.")
+sb = SET[1]
+P.t = sb
 endur_cap = P.slider("Потолок кросса за занятие (км)", 2.0, 12.0, 5.0, 0.5,
                      help="В таблице Грузенкина кросс доходит до ~10 км за занятие (618 км в год, 1987–88). Здесь вы задаёте потолок сами.")
 
 
+# тесты СФП: из журнала (приоритет), иначе из профиля, если отмечено «замерены лично»
+_TJ = ds.tests_from_journal(list(STATE.get("log", [])), pd.Timestamp(os.environ.get("DECA_TODAY") or today_local()))
+TEST_VALS = {k: v["value"] for k, v in _TJ.items()}
+TEST_SRC = {k: f"журнал, {v['date'][8:10]}.{v['date'][5:7]}" for k, v in _TJ.items()}
+if has_tests:
+    for _k, _v in (("vmax", v_max), ("triple_sj", t_triple), ("shot_bwd", t_shot), ("bench", t_bench), ("t1000", t_1000)):
+        if _k not in TEST_VALS:
+            TEST_VALS[_k] = float(_v)
+            TEST_SRC[_k] = "профиль (вручную)"
+TEST_ASSESS = ds.tests_assessment(TEST_VALS, res)
+TEST_RES = ds.tests_to_results(TEST_VALS, res)             # функция «тест → результат вида» по Грузенкину (ядро назад / толчок с места / диск с места)
+FGAP = ds.function_gaps(TEST_RES)
+T_MULT = ds.tests_emphasis(TEST_ASSESS, fgap=FGAP) if use_tests_emph else {}
 STRETCH_UI = {e: float(st.session_state.get(f"st_{e}", INIT.get(f"st_{e}", ds.STRETCH[e]))) for e in EV}      # «потолки» из вкладки «Цель → результаты»
 EMPH = ds.emphasis_from_profile(res, STRETCH_UI, strength=float(indiv))
 EMPH_HEAD = dict(EMPH)
@@ -4849,13 +5538,14 @@ else:
             HB = ds.hours_by_event_from_plan(_bp)
             EMPH_LAWD = ds.emphasis_hours_law(res, HB, STRETCH_UI, strength=float(indiv))
             EMPH = ds.emphasis_blend(EMPH_HEAD, EMPH_LAWD, float(w_hours))
+        EMPH = ds.apply_emphasis(EMPH, T_MULT)
         df = gen_plan(str(d_start.date()), str(d_hept.date()), str(d_dec.date()), float(vol_scale), tuple(sorted(EMPH.items())), float(endur_cap))
     except Exception as exc:  # noqa: BLE001
         plan_note = f"Не удалось построить план для этих параметров ({exc}). Показан запасной план из файла."
 if df is None:
     df = load_csv()
 if df is None:
-    up = sb.file_uploader("Загрузите season_plan.csv", type="csv")
+    up = SET[1].file_uploader("Загрузите season_plan.csv", type="csv")
     if up is not None:
         df = pd.read_csv(up)
 
@@ -4872,7 +5562,7 @@ def _norm(d):
     return d
 
 
-real_today = pd.Timestamp(os.environ.get("DECA_TODAY") or pd.Timestamp.today()).normalize()
+real_today = pd.Timestamp(os.environ.get("DECA_TODAY") or today_local()).normalize()      # «сегодня» по Минску
 LOG = list(STATE.get("log", []))
 LOGD = ds.log_by_date(LOG)
 if df is not None:
@@ -4891,15 +5581,67 @@ if df is not None and (DEF or FORMX):
         df = pd.concat([df_base[df_base["date"] < real_today], df_adj[df_adj["date"] >= real_today]], ignore_index=True)
     except Exception:  # noqa: BLE001
         DEF, FORMX = {}, {}
-if plan_note:
-    st.warning(plan_note)
-
-sb.header("⚡ Сегодня")
 p0, p1 = (df["date"].min(), df["date"].max()) if df is not None else (DEF_START, DEF_DEC - pd.Timedelta(days=1))
-today = min(max(pd.Timestamp.today().normalize(), p0), p1)
-cur_date = pd.Timestamp(P.date_input("Дата", value=today.date(), min_value=p0.date(), max_value=p1.date(), _save=False))
-sleep = P.slider("Сон / восстановление (1–10)", 1, 10, 8)
-sore = P.slider("Боль в мышцах/связках (1–10)", 1, 10, 3)
+today = min(max(real_today, p0), p1)
+WD_RU = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+
+
+def _goto(d):
+    st.session_state["w:Дата"] = min(max(pd.Timestamp(d).normalize(), p0), p1).date()
+
+
+def _shift(n):
+    _goto(pd.Timestamp(st.session_state.get("w:Дата") or today.date()) + pd.Timedelta(days=n))
+
+
+def day_status(d):
+    """(значок, текст) о том, что известно про день d: записан ли он."""
+    e = LOGD.get(str(d.date()))
+    if e:
+        mins = float(e.get("minutes") or 0)
+        its = e.get("items") or []
+        if e.get("rest") and not its:
+            return "😴", "записан как отдых"
+        au = float(e.get("rpe_ovr") or e.get("rpe") or 0) * mins
+        return "✅", (f"записано: {len(its)} упр., {mins:.0f} мин, нагрузка {au:.0f}" if its else f"записано в журнале: {mins:.0f} мин, нагрузка {au:.0f}")
+    if d > real_today:
+        return "📅", "день ещё не наступил"
+    if d == real_today:
+        return "⏳", "сегодня ещё не записано"
+    return "➖", "записи нет (для модели это день отдыха)"
+
+
+PR_LABEL = {"100m": "100 м (с)", "LJ": "Длина (м)", "SP": "Ядро (м)", "HJ": "Высота (м)", "400m": "400 м (с)", "110mH": "110 м с/б (с)", "DT": "Диск (м)",
+            "PV": "Шест (м)", "JT": "Копьё (м)", "1500m": "1500 м (с)"}          # подписи полей профиля (ключ виджета = "w:" + подпись)
+
+
+def _accept_pr(e, v):
+    st.session_state["w:" + PR_LABEL[e]] = float(v)           # выполняется до перерисовки: поле профиля получит новое значение, прогноз и очки пересчитаются
+
+
+def render_pr(cands, prefix):
+    """Кандидаты в личные результаты: тренировочный результат полного вида лучше записанного в профиле. Решение — кнопкой, автоматически ничего не меняется."""
+    for _, r_ in cands.iterrows():
+        c1_, c2_ = st.columns([5, 2])
+        unit_ = "с" if r_["event"] in ("100m", "400m", "110mH", "1500m") else "м"
+        c1_.markdown(f"🏅 **{RU[r_['event']]}**: {r_['value']:g} {unit_} ({r_['exercise']}, {r_['date']}) лучше результата в профиле {r_['current']:g} {unit_} → **+{r_['d_pts']:.0f} очк.**")
+        c2_.button("Принять как личный", on_click=_accept_pr, args=(r_["event"], r_["value"]), key=f"{prefix}_pr_{r_['event']}", use_container_width=True)
+
+
+with TOP:
+    _fl = st.session_state.pop("_flash", None)
+    if _fl:
+        getattr(st, _fl[0])(_fl[1])
+        if _fl[0] == "success" and hasattr(st, "toast"):
+            st.toast(_fl[1])
+    if plan_note:
+        st.warning(plan_note)
+    nv1, nv2, nv3, nv4 = st.columns([1.2, 3, 1.2, 2.4])
+    nv1.button("◀ день", on_click=_shift, args=(-1,), key="nav_prev", use_container_width=True)
+    P.t = nv2
+    cur_date = pd.Timestamp(P.date_input("Дата", value=today.date(), min_value=p0.date(), max_value=p1.date(), _save=False, label_visibility="collapsed"))
+    nv3.button("день ▶", on_click=_shift, args=(1,), key="nav_next", use_container_width=True)
+    nv4.button("К сегодняшнему дню", on_click=_goto, args=(today,), key="nav_today", use_container_width=True)
 
 # ───────────────────────── расчёты (всё живое) ─────────────────────────
 pts = {e: calc_pts(e, v) for e, v in res.items()}
@@ -4919,26 +5661,45 @@ ST_REAL = AN.get("state")                       # состояние фитне�
 LAST = AN.get("last_logged")
 
 # пометки шлюзов считаются заново с вашими параметрами модели (и, если есть журнал, от реального состояния)
+# последовательность для прогноза: пропущенные (не записанные) дни после последней записи — отдых, с сегодняшнего дня — план
+if df is not None:
+    seq, seq_dates = ds.forecast_seq(df, LAST if (ST_REAL is not None and LAST is not None) else None, real_today, with_dates=True)
+    if len(seq) < 7:
+        seq, seq_dates = list(df.session_key)[-7:], list(df["date"])[-7:]
+else:
+    seq, seq_dates = ds.TYPICAL_SEQ(max(horizon, 7)), []
+GAP_DAYS = max(0, (real_today - LAST).days - 1) if (ST_REAL is not None and LAST is not None) else 0
+
+with TOP:                         # строка статуса дня и предупреждение о пропущенных днях (нужны журнал и состояние, поэтому ниже)
+    _rw = df[df["date"] == cur_date] if df is not None else None
+    _ph = str(_rw.iloc[0]["phase"]) if (_rw is not None and len(_rw)) else "вне плана"
+    _ic, _tx = day_status(cur_date)
+    _line = f"{_ic} **{cur_date:%d.%m.%Y}, {WD_RU[cur_date.weekday()]}** · {_ph} · {_tx}"
+    if _ic == "✅":
+        st.success(_line)
+    elif _ic == "⏳":
+        st.warning(_line)
+    else:
+        st.info(_line)
+    if GAP_DAYS >= 3:
+        st.warning(f"Последняя запись в журнале — {LAST:%d.%m} ({GAP_DAYS} дн. назад). Дни без записей модель считает отдыхом, и прогноз уже учитывает паузу. Если вы тренировались — внесите дни.")
+
+# пометки шлюзов по дням плана (с реального состояния, если есть журнал; иначе с типовой недели по всему плану)
 if df is not None:
     ath_ = ds.Athlete("live", float(ath_mass), dict(res), ("DT", "JT", "1500m"), dict(noise))
-    fut = df["date"] > LAST if (ST_REAL is not None and LAST is not None) else pd.Series(True, index=df.index)
-    sub = df[fut]
     notes = [""] * len(df)
-    if len(sub):
-        _sol = ds.DailySolver(model, ath_, ST_REAL if ST_REAL is not None else ds.warm_start(model))
-        _tr = _sol._run(list(sub.session_key), True)[4]
-        for i_, t_ in zip(sub.index, _tr):
-            notes[df.index.get_loc(i_)] = ("шлюз: " + ",".join(t_["bad"])) if t_["bad"] else ""
-    df["gate_note"] = notes
-
-if df is not None:
     if ST_REAL is not None and LAST is not None:
-        rest = list(df[df["date"] > LAST].session_key)
+        keys_, dates_, st_g = seq, seq_dates, ST_REAL
     else:
-        rest = list(df[df["date"] >= cur_date].session_key)
-    seq = rest if len(rest) >= 7 else list(df.session_key)[-7:]
-else:
-    seq = ds.TYPICAL_SEQ(max(horizon, 7))
+        keys_, dates_, st_g = list(df.session_key), list(df["date"]), ds.warm_start(model)
+    if keys_ and len(dates_) == len(keys_):
+        _tr = ds.DailySolver(model, ath_, st_g)._run(list(keys_), True)[4]
+        pos_ = {pd.Timestamp(d_).normalize(): i_ for i_, d_ in enumerate(df["date"])}
+        for d_, t_ in zip(dates_, _tr):
+            i_ = pos_.get(pd.Timestamp(d_).normalize())
+            if i_ is not None and t_["bad"]:
+                notes[i_] = "шлюз: " + ",".join(t_["bad"])
+    df["gate_note"] = notes
 RES_F = ds.result_adjust(res, EF, float(adj_k)) if (use_adj and len(EF)) else res
 F = ds.live_forecast(RES_F, ath_mass, seq, model=model, noise_sd=noise, sims=sims, seed=0, loss=loss_n, state=ST_REAL, corr=CORR_M)
 F0 = ds.live_forecast(dict(D.current), 77.5, seq, model=model0, noise_sd=dict(D.noise_sd), sims=sims, seed=0, state=ST_REAL, corr=CORR_M)   # эталон: стартовые данные и модель
@@ -4956,33 +5717,55 @@ def interp_level(tab, val):
     return float(np.interp(val, x, y))
 
 
-kd2v = ds.kd2(v_max, ath_height, ath_mass, t_triple, t_shot, t_bench, t_1000) if has_tests else None
+kd2v = (ds.kd2(TEST_VALS["vmax"], ath_height, ath_mass, TEST_VALS["triple_sj"], TEST_VALS["shot_bwd"], TEST_VALS["bench"], TEST_VALS["t1000"])
+        if all(k in TEST_VALS for k in ("vmax", "triple_sj", "shot_bwd", "bench", "t1000")) else None)
 
 mt = F["mc_total"]
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Сумма личных результатов (10 видов)", f"{sum_cur}", f"{sum_cur - 7500:+d} к уровню 7500")
-m2.metric("Прогноз модели к старту (по плану)", f"{F['sum_forecast']:.0f}", f"{F['sum_forecast'] - F0['sum_forecast']:+.0f} к эталону")
-m3.metric("Монте-Карло: медиана турнира", f"{mt['median']:.0f}", f"{mt['median'] - F0['mc_total']['median']:+.0f} к эталону")
-m4.metric(f"Консервативно (прогноз − {loss_n})", f"{F['sum_forecast'] - loss_n:.0f}", f"P(≥7000) = {mt['P(>=7000)']:.0%}")
-m5.metric("Семиборье, сумма личных (7 видов)", f"{sum_hep}", f"Универсиада 2026: 5117 ({sum_hep - 5117:+d})")
-st.caption(f"«Эталон» = стартовые данные (сумма 7266) и стартовая модель без правок. Прогноз считается от {cur_date:%d.%m.%Y} по оставшемуся плану "
-           f"({len(seq)} дн.), состояние усталости/фитнеса на старте — типовая неделя (я не знаю вашего журнала).")
-
-tabs = st.tabs(["⚡ Сегодня и неделя", "📝 Журнал", "📊 Факт и анализ", "🗺 Весь сезон", "📊 Прогноз модели", "🎯 Цель → результаты", "📈 Нормы Хейнлы",
-                "🏁 Семиборье", "🧭 Профили", "🏛 Тесты СФП", "🧠 Модель", "📚 История", "🔗 Связи и часы"])
+with FC_TOP:
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Сумма личных результатов (10 видов)", f"{sum_cur}", f"{sum_cur - 7500:+d} к уровню 7500")
+    m2.metric("Прогноз модели к старту (по плану)", f"{F['sum_forecast']:.0f}", f"{F['sum_forecast'] - F0['sum_forecast']:+.0f} к эталону")
+    m3.metric("Монте-Карло: медиана турнира", f"{mt['median']:.0f}", f"{mt['median'] - F0['mc_total']['median']:+.0f} к эталону")
+    m4.metric(f"Консервативно (прогноз − {loss_n})", f"{F['sum_forecast'] - loss_n:.0f}", f"P(≥7000) = {mt['P(>=7000)']:.0%}")
+    m5.metric("Семиборье, сумма личных (7 видов)", f"{sum_hep}", f"Универсиада 2026: 5117 ({sum_hep - 5117:+d})")
+    if ST_REAL is not None and LAST is not None:
+        _basis = (f"Старт прогноза — состояние по вашему журналу (последняя запись {LAST:%d.%m.%Y}). "
+                  + (f"**{GAP_DAYS} дн. без записей после неё считаются отдыхом** (так же считает нагрузка недели): если вы тренировались, внесите эти дни. " if GAP_DAYS else "")
+                  + f"Дальше — план с {real_today:%d.%m.%Y} ({len(seq) - GAP_DAYS} дн.).")
+    else:
+        _basis = (f"Журнала с ≥ 7 днями тренировок пока нет, поэтому старт прогноза — «типовая неделя», а записи его не меняют. Прогноз считается по плану с {real_today:%d.%m.%Y} "
+                  f"({len(seq)} дн.).")
+    st.caption("«Эталон» = стартовые данные (сумма 7266) и стартовая модель без правок. " + _basis + " Личные результаты отнесены к форме «после типовой недели»: "
+               "усталость от вчерашней тренировки не делает рекорд «выше», а прогноз — «лучше».")
 
 # ───────────────────────── сегодня ─────────────────────────
+def _sig(items):
+    """Подпись состава тренировки для сравнения «на экране» и «в дневнике» (без служебных полей, с округлением)."""
+    out = []
+    for x in items:
+        d = {k: v for k, v in x.items() if k not in ("uid", "res_txt", "res")}
+        d = {k: (round(float(v), 3) if isinstance(v, (int, float)) and not isinstance(v, bool) else v) for k, v in d.items()}
+        d["res"] = [round(float(v), 3) for v in (x.get("res") or [])]
+        out.append(json.dumps(d, sort_keys=True, ensure_ascii=False))
+    return sorted(out)
+
+
 with tabs[0]:
     if df is None:
-        st.error("Файл season_plan.csv не найден. Положите его рядом с app.py или загрузите в боковой панели.")
+        st.error("Файл season_plan.csv не найден. Положите его рядом с программой или загрузите в «⚙️ Данные и модель → 📅 Календарь и объём».")
     else:
         row = df[df["date"] == cur_date]
         r = row.iloc[0] if len(row) else df.iloc[0]
-        st.subheader(f"{r['date']:%d.%m.%Y} ({r['weekday']})")
-        c1, c2, c3 = st.columns(3)
-        c1.info(f"**Этап:** {r['phase']}")
-        c2.info(f"**Волна объёма:** ×{r['volume_factor']:.2f} (недельная волна моя: 1,0 / 1,1 / 0,75)")
-        c3.info(f"**Ключ сессии:** `{r['session_key']}`")
+        if not LOG:
+            with st.expander("👋 Как пользоваться (три шага)", expanded=True):
+                st.markdown("1. Вверху выберите день (по умолчанию сегодня).\n"
+                            "2. Ниже соберите тренировку из каталога (или нажмите «Заполнить по плану дня») и впишите результаты: секунды, метры, высоту.\n"
+                            "3. Нажмите **«Записать тренировку»**. Вверху страницы появится зелёная строка «✅ записано», а под кнопкой — где именно лежат данные.\n\n"
+                            "Если в боковой панели написано «Облако не подключено», записи пропадут при перезапуске сервера: подключите облако (DEPLOY.md) или скачивайте копию.")
+
+        # ── 1. что по плану
+        st.markdown("### 1 · Что по плану")
+        st.caption(f"Этап: {r['phase']} · волна объёма ×{r['volume_factor']:.2f} (недельная волна — моя: 1,0 / 1,1 / 0,75) · ключ сессии `{r['session_key']}`")
         text = str(r["plan"])
         if "||" in text:
             am, pm = text.split("||", 1)
@@ -4990,6 +5773,13 @@ with tabs[0]:
             st.markdown(f"**Вечер:** {pm.replace('ВЕЧЕР:', '').strip()}")
         else:
             st.markdown(f"**План:** {text}")
+
+        sc1, sc2 = st.columns(2)
+        with sc1:
+            sleep = X.slider("Сон / восстановление (1–10)", 1, 10, 8)
+        with sc2:
+            sore = X.slider("Боль в мышцах/связках (1–10)", 1, 10, 3)
+
         no_load = str(r["session_key"]) == "S_REST" or text.startswith(("СТАРТ", "Отдых"))
         if no_load:
             st.success("День без нагрузки или старт.")
@@ -5004,17 +5794,17 @@ with tabs[0]:
                        + ". Пороги условные, не из литературы.")
         elif str(r.get("gate_note", "")):
             st.warning(f"Совет шлюзов модели: `{r['gate_note']}` (экспертные пороги, занятие не менялось). Следите за пульсом и техникой.")
-        else:
-            st.success("Предупреждений нет.")
-        st.markdown("#### Ближайшие 7 дней")
-        wk = df[(df["date"] >= cur_date) & (df["date"] < cur_date + pd.Timedelta(days=7))].copy()
-        wk["Дата"] = wk["date"].dt.strftime("%d.%m")
-        st.dataframe(wk[["Дата", "weekday", "plan", "gate_note"]].rename(columns={"weekday": "День", "plan": "План", "gate_note": "Шлюз"}),
-                     use_container_width=True, hide_index=True)
 
-        # ───── конструктор тренировки из каталога ─────
+        with st.expander("Неделя вокруг выбранного дня", expanded=False):
+            wk = df[(df["date"] >= cur_date - pd.Timedelta(days=2)) & (df["date"] <= cur_date + pd.Timedelta(days=4))].copy()
+            wk["Дата"] = [("▶ " if d_ == cur_date else "") + d_.strftime("%d.%m") for d_ in wk["date"]]
+            wk["Статус"] = [" ".join(day_status(d_)) for d_ in wk["date"]]
+            st.dataframe(wk[["Дата", "weekday", "Статус", "plan", "gate_note"]].rename(columns={"weekday": "День", "plan": "План", "gate_note": "Шлюз"}),
+                         use_container_width=True, hide_index=True)
+
+        # ── 2. конструктор
         st.markdown("---")
-        st.markdown("### 🧩 Собрать тренировку из каталога")
+        st.markdown("### 2 · Собрать тренировку")
         st.caption(f"В каталоге {len(ds.CATALOG)} позиций (разминка, ОФП/СФП, бег по отрезкам, барьеры, прыжки, метания, сила, плиометрика, выносливость, ядро, восстановление). "
                    "Вы выбираете и задаёте дозу — система считает нагрузку, смотрит шлюзы и конфликты и предлагает, что добавить. "
                    "**Все стрессы упражнений, пороги и правила — мои экспертные допущения, а не измерения и не нормы из литературы.**")
@@ -5062,39 +5852,63 @@ with tabs[0]:
         HIST_C = ds.result_history(LOG, before=iso_c)
         planned_c = ds._json_loads(r["vol"]) if ("vol" in r.index) else {}
         fb1, fb2, fb3, fb4 = st.columns(4)
-        fb1.button("📋 Заполнить по плану дня", on_click=_fill_plan, kwargs=dict(pv=planned_c), key=f"cf_{iso_c}",
+        fb1.button("📋 Заполнить по плану дня", on_click=_fill_plan, kwargs=dict(pv=planned_c), key=f"cf_{iso_c}", use_container_width=True,
                    help="Подставляет по одной типовой позиции на каждое средство плана; дальше правьте как хотите.")
-        fb2.button("🧹 Очистить", on_click=_clear, key=f"cc_{iso_c}")
-        fb3.button("🔥 Подобрать разминку", on_click=_auto_wu, key=f"cw_{iso_c}", help="Разминка под основную часть: общая + специальная (ускорения, прыжковая, метательная, барьерная). Правило моё.")
-        fb4.button("🧊 Подобрать заминку", on_click=_auto_cd, key=f"cd_{iso_c}")
+        fb2.button("🧹 Очистить", on_click=_clear, key=f"cc_{iso_c}", use_container_width=True)
+        fb3.button("🔥 Подобрать разминку", on_click=_auto_wu, key=f"cw_{iso_c}", use_container_width=True,
+                   help="Разминка под основную часть: общая + специальная (ускорения, прыжковая, метательная, барьерная). Правило моё.")
+        fb4.button("🧊 Подобрать заминку", on_click=_auto_cd, key=f"cd_{iso_c}", use_container_width=True)
 
-        f1, f2, f3, f4 = st.columns([2, 2, 2, 3])
-        cats_all = sorted({c.cat for c in ds.CATALOG})
-        kinds_all = sorted({c.kind for c in ds.CATALOG})
-        fcat = f1.multiselect("Раздел", cats_all, key="cat_f")
-        fkind = f2.multiselect("Тип", kinds_all, key="cat_k")
-        fev = f3.multiselect("Для вида", list(ds.RU_EV), format_func=lambda e: ds.RU_EV[e], key="cat_e")
-        fq = f4.text_input("Поиск", key="cat_q")
-        only_ph = st.checkbox("Только подходящие этапу подготовки", value=True, key="cat_ph")
-        stage_c = str(r["phase"])[:1] if str(r["phase"])[:1] in "ABC" else "C"
-        cand = [c for c in ds.CATALOG if (not fcat or c.cat in fcat) and (not fkind or c.kind in fkind) and (not fev or set(fev) & set(c.tags))
-                and (not fq or fq.lower() in (c.name + " " + c.note + " " + c.cat).lower()) and (not only_ph or stage_c in c.phases)]
-        st.caption(f"Найдено: {len(cand)}")
-        pick = st.multiselect("Выберите позиции и нажмите «Добавить»", [c.id for c in cand], key=f"cat_pick_{len(cand)}",
-                              format_func=lambda i: f"{ds.CAT[i].cat} · {ds.CAT[i].name} — {ds.CAT[i].std_text()}")
+        with st.expander("⚡ Быстрая запись текстом", expanded=True):
+            qt_key = f"qt_{iso_c}"
+            qtext = st.text_input("Что было (через запятую)", key=qt_key, placeholder="длина 6.85, ядро 14.20, диск с места 33, присед 180х3, 100 м 11.2")
+            QP = ds.parse_quick(qtext) if qtext.strip() else None
+            if QP:
+                for l_ in QP["lines"]:
+                    st.markdown("• " + l_)
+                for w_ in QP["warnings"]:
+                    st.warning(w_)
+                if QP["unparsed"]:
+                    st.caption("Не понял: " + "; ".join(QP["unparsed"]) + ". Добавьте это из каталога ниже.")
+                if QP["date_word"] in ("вчера", "позавчера"):
+                    st.caption(f"Слово «{QP['date_word']}» не меняет день: запись пойдёт в выбранный сверху ({cur_date:%d.%m}). Переключите день стрелками, если нужно другое.")
 
-        def _add_many(ids):
-            for i_ in ids:
-                _add(i_)
-        st.button("➕ Добавить выбранное", on_click=_add_many, args=(list(pick),), key="cat_add")
-        with st.expander("Показать каталог таблицей"):
-            st.dataframe(pd.DataFrame([dict(Раздел=c.cat, Название=c.name, Тип=c.kind, Доза=c.std_text(), Мин=c.minutes, RPE=c.rpe,
-                                            ЦНС=c.stress[0], Метаб=c.stress[1], Механика=c.stress[2], Виды=", ".join(c.tags), Этапы=c.phases, Заметка=c.note) for c in cand]),
-                         use_container_width=True, hide_index=True)
+            def _add_quick(items, key=qt_key, lst=CL):
+                for x_ in items:
+                    lst.append(dict(x_, uid=_uid(), res_txt=" ".join(f"{v:g}" for v in x_.get("res", []))))
+                st.session_state[key] = ""
+            st.button("➕ Добавить в тренировку", on_click=_add_quick, args=((QP["items"] if QP else []),), disabled=not (QP and QP["items"]), key=f"qadd_{iso_c}")
+            st.caption("Слова: длина, высота, шест, ядро, диск, копьё (без уточнения — полные попытки; «соревнование» — серия), «ядро снизу/назад» (тест 7,26 кг), «диск с места», «ядро с места», «тройной», "
+                       "«30 м с хода», 100 м, 110 с/б, 400 м, 1000 м, 1500 м (время 4:40), жим/присед/рывок/становая — вес×повторы×серии («присед 180х3», одно число — один подход). "
+                       "Разбор по таблице слов, не нейросетью: что распознано, видно выше. После добавления проверьте список ниже и нажмите «Записать тренировку».")
+
+        with st.expander("➕ Добавить упражнения из каталога", expanded=True):
+            f1, f2, f3, f4 = st.columns([2, 2, 2, 3])
+            cats_all = sorted({c.cat for c in ds.CATALOG})
+            kinds_all = sorted({c.kind for c in ds.CATALOG})
+            fcat = f1.multiselect("Раздел", cats_all, key="cat_f")
+            fkind = f2.multiselect("Тип", kinds_all, key="cat_k")
+            fev = f3.multiselect("Для вида", list(ds.RU_EV), format_func=lambda e: ds.RU_EV[e], key="cat_e")
+            fq = f4.text_input("Поиск", key="cat_q")
+            only_ph = st.checkbox("Только подходящие этапу подготовки", value=True, key="cat_ph")
+            stage_c = str(r["phase"])[:1] if str(r["phase"])[:1] in "ABC" else "C"
+            cand = [c for c in ds.CATALOG if (not fcat or c.cat in fcat) and (not fkind or c.kind in fkind) and (not fev or set(fev) & set(c.tags))
+                    and (not fq or fq.lower() in (c.name + " " + c.note + " " + c.cat).lower()) and (not only_ph or stage_c in c.phases)]
+            pick = st.multiselect(f"Найдено: {len(cand)}. Выберите позиции и нажмите «Добавить»", [c.id for c in cand], key=f"cat_pick_{len(cand)}",
+                                  format_func=lambda i: f"{ds.CAT[i].cat} · {ds.CAT[i].name} — {ds.CAT[i].std_text()}")
+
+            def _add_many(ids):
+                for i_ in ids:
+                    _add(i_)
+            st.button("➕ Добавить выбранное", on_click=_add_many, args=(list(pick),), key="cat_add")
+            if st.checkbox("Показать найденное таблицей", key="cat_tbl"):
+                st.dataframe(pd.DataFrame([dict(Раздел=c.cat, Название=c.name, Тип=c.kind, Доза=c.std_text(), Мин=c.minutes, RPE=c.rpe,
+                                                ЦНС=c.stress[0], Метаб=c.stress[1], Механика=c.stress[2], Виды=", ".join(c.tags), Этапы=c.phases, Заметка=c.note) for c in cand]),
+                             use_container_width=True, hide_index=True)
 
         st.markdown("#### Моя тренировка")
         if not CL:
-            st.info("Пока пусто: добавьте позиции выше или нажмите «Заполнить по плану».")
+            st.info("Пока пусто: добавьте позиции из каталога или нажмите «Заполнить по плану дня».")
         CL.sort(key=lambda x: ds.part_of(ds.CAT[x["id"]]))
         prev_part = -1
         for k_, it_ in enumerate(CL):
@@ -5135,6 +5949,9 @@ with tabs[0]:
                 else:
                     st.caption("Результатов этого упражнения в журнале ещё нет.")
 
+        # ── 3. анализ (считается по составу, но показывается после блока записи)
+        A = None
+        rpe_ov = 0.0
         if CL:
             tr = ds.week_channel_load(LOG, cur_date) if LOG else None
             hour_c = (ST_REAL.t0 + 24.0 * max(0, (cur_date - LAST).days - 1)) if (ST_REAL is not None and LAST is not None) else None
@@ -5144,19 +5961,72 @@ with tabs[0]:
                                rpe_override=(rpe_ov or None), hour=hour_c, stage=stage_c, weak=weak_c, history=LOG, date=iso_c,
                                readiness=dict(sleep=sleep, sore=sore), mass=float(ath_mass),
                                form=(dict(zip(EF['event'], EF['Статус'])) if len(EF) else None))
-            st.markdown("#### Анализ")
-            q1, q2, q3, q4 = st.columns(4)
+
+        # ── запись
+        st.markdown("---")
+        st.markdown("### 3 · Записать")
+        ex_s = LOGD.get(iso_c)
+        saved_items = bool(ex_s and ex_s.get("items"))
+        can_rec = cur_date <= real_today
+
+        def _record_training():
+            gv = {}
+            for x in CL:
+                cc_, phi_ = ds.item_dose(x)
+                if cc_.group:
+                    gv[cc_.group] = round(gv.get(cc_.group, 0.0) + cc_.log_volume(phi_), 3)
+            ex_c = dict(LOGD.get(iso_c) or {})
+            ex_c.update({"sleep_score": int(sleep)})
+            if not ex_c.get("sore"):
+                ex_c["sore"] = int(sore)
+            ex_c.update({"date": iso_c, "rest": False, "items": [{k: v for k, v in x.items() if k not in ("uid", "res_txt")} for x in CL], "groups": gv,
+                         "minutes": int(round(A["minutes"])), "rpe": round(A["AU"] / max(A["minutes"], 1), 2)})
+            if rpe_ov:
+                ex_c["rpe_ovr"] = float(rpe_ov)
+            else:
+                ex_c.pop("rpe_ovr", None)
+            newlog = sorted([e for e in LOG if e["date"] != iso_c] + [ex_c], key=lambda e: e["date"])
+            commit(dict(STATE, log=newlog), f"Тренировка {cur_date:%d.%m} записана: {len(CL)} упр., {A['minutes']:.0f} мин, нагрузка {A['AU']:.0f}")
+
+        def _record_rest():
+            ex_c = {k: v for k, v in (LOGD.get(iso_c) or {}).items() if k not in ("items", "groups", "minutes", "rpe", "rpe_ovr")}
+            ex_c.update({"date": iso_c, "rest": True, "groups": {}, "minutes": 0, "rpe": 1})
+            newlog = sorted([e for e in LOG if e["date"] != iso_c] + [ex_c], key=lambda e: e["date"])
+            commit(dict(STATE, log=newlog), f"{cur_date:%d.%m}: записан день без тренировки")
+
+        if saved_items and CL and _sig(CL) == _sig(ex_s["items"]):
+            st.success("✅ Записано в дневник. На экране ровно то, что записано.")
+        elif saved_items:
+            st.warning("⚠️ В дневнике этот день записан иначе, чем на экране. Нажмите «Обновить запись», чтобы заменить.")
+        elif ex_s and ex_s.get("rest"):
+            st.info("😴 День записан как отдых. Если тренировка всё-таки была — запишите её, отметка отдыха заменится.")
+        elif ex_s:
+            st.info("День записан в журнале без упражнений (Дневник → Запись дня). Запись из конструктора заменит его состав, чек-ин и заметка сохранятся.")
+        elif CL:
+            st.info("● Пока не записано. Собранная тренировка живёт, только пока открыта страница: нажмите «Записать тренировку».")
+        else:
+            st.caption("Соберите тренировку выше и нажмите «Записать тренировку» — или отметьте день без тренировки.")
+        if CL:
+            q1, q2, q3 = st.columns(3)
             q1.metric("Время", f"{A['minutes']:.0f} мин")
             q2.metric("Нагрузка (мин×RPE)", f"{A['AU']:.0f}", f"RPE ≈ {A['AU'] / max(A['minutes'], 1):.1f}")
-            q3.metric("Доза ЦНС / метаб. / механ.", " / ".join(f"{x:.1f}" for x in A["dose"]))
-            q4.metric("Допуск по самочувствию", f"{100 * A['readiness_factor']:.0f} %", f"сон {sleep}/10, боль {sore}/10")
+            q3.metric("Допуск по самочувствию", f"{100 * A['readiness_factor']:.0f} %", f"сон {sleep}/10, боль {sore}/10")
+        bb1, bb2 = st.columns(2)
+        if bb1.button(("💾 Обновить запись" if saved_items else "✅ Записать тренировку"), type="primary", disabled=(not CL or not can_rec), key=f"csave_{iso_c}", use_container_width=True):
+            _record_training()
+        if bb2.button("😴 День без тренировки", disabled=not can_rec, key=f"crest_{iso_c}", use_container_width=True):
+            _record_rest()
+        if not can_rec:
+            st.caption("Записать можно только сегодняшний и прошедшие дни. Для будущих дней конструктор работает как проверка плана (анализ ниже).")
+
+        # ── анализ
+        if CL:
+            st.markdown("### 4 · Анализ тренировки")
+            st.metric("Доза ЦНС / метаб. / механ.", " / ".join(f"{x:.1f}" for x in A["dose"]))
             st.caption(f"Разминка: {A.get('warmup_min', 0):.0f} мин · затронуты виды: " + (", ".join(ds.RU_EV.get(e, e) for e in A["events_touched"]) or "—")
-                       + ". Сон и боль берутся из боковой панели «Сегодня».")
+                       + ". Сон и боль берутся из блока «Что по плану» выше.")
             for w_ in A["warnings"]:
                 (st.success if w_.startswith("Конфликтов") else st.warning)(w_)
-            if len(A["loads"]):
-                st.markdown("**Вес: штанга и снаряды**")
-                st.dataframe(A["loads"], use_container_width=True, hide_index=True)
             if len(A["results"]):
                 st.markdown("**Результаты на тренировке**")
                 st.dataframe(A["results"], use_container_width=True, hide_index=True)
@@ -5164,58 +6034,45 @@ with tabs[0]:
                     (st.success if "новый лучший" in n_ else st.info if "стартовую точку" in n_ else st.warning)(n_)
                 st.caption("Интенсивность = ваше среднее / ваш лучший результат этого упражнения (по журналу). Множитель дозы: 1,0 при 97 % от лучшего, "
                            "±2 за каждую единицу отклонения, в пределах 0,75–1,15 — это мой допуск, он меняет учтённую нагрузку и утомление. Пороги потери результата — практические правила, не нормативы.")
-            if "pools_now" in A and ST_REAL is not None:
-                thr = ds.BioGates(ds.GateConfig(), model.const).cns_thr
-                st.dataframe(pd.DataFrame({"Пул": ["ЦНС", "Метаболизм", "Механика"], "Сейчас": np.round(A["pools_now"], 2), "После тренировки": np.round(A["pools_after"], 2)})
-                             .assign(**{"Порог ЦНС для «нервных» блоков": [round(float(thr), 2), None, None]}), use_container_width=True, hide_index=True)
-            else:
-                st.caption("Состояние пулов неизвестно (мало записей в журнале) — шлюзы по текущему утомлению не проверялись.")
-            show = A["items"][["name", "cat", "dose", "minutes", "AU", "cns", "met", "mech", "gate"]].rename(columns={
-                "name": "Упражнение", "cat": "Раздел", "dose": "Доза", "minutes": "Мин", "AU": "AU", "cns": "ЦНС", "met": "Метаб", "mech": "Механика", "gate": "Шлюз"})
-            st.dataframe(show, use_container_width=True, hide_index=True)
+            _log_d = [e for e in LOG if e["date"] != iso_c] + [dict(date=iso_c, items=[{k: v for k, v in x.items() if k not in ("uid", "res_txt")} for x in CL])]
+            _pc = ds.pr_candidates(_log_d, res)
+            _pc = _pc[_pc["date"] == iso_c]
+            if len(_pc):
+                st.markdown("**🏅 Лучше результата в вашем профиле**")
+                render_pr(_pc, "td")
+                st.caption("Тренировочный результат — не рекорд (ветер, замер, правила вида). Нажмите «Принять», только если уверены; тогда очки, профиль и прогноз пересчитаются.")
             if A["suggest"]:
                 st.markdown("**Что можно добавить** (подбор по моим правилам: слабые виды, недобранные за неделю каналы, шлюзы):")
                 for sg in A["suggest"][:6]:
                     s1, s2 = st.columns([6, 1])
                     s1.markdown(f"• {sg['name']} — <small>{sg['why']}</small>", unsafe_allow_html=True)
                     s2.button("➕", on_click=_add, args=(sg["id"],), key=f"sg_{sg['id']}_{len(CL)}")
-            # сравнение с планом
-            if planned_c:
-                gsum = {}
-                for x in CL:
-                    cc_, phi_ = ds.item_dose(x)
-                    if cc_.group:
-                        gsum[cc_.group] = gsum.get(cc_.group, 0.0) + cc_.log_volume(phi_)
-                cmpr = [dict(Средство=ds.LOG_GROUPS[g][0], Единица=ds.LOG_GROUPS[g][1], План=round(float(v), 1), Выбрано=round(gsum.get(g, 0.0), 1)) for g, v in planned_c.items() if g in ds.LOG_GROUPS]
-                if cmpr:
-                    st.markdown("**Сравнение с планом дня**")
-                    st.dataframe(pd.DataFrame(cmpr), use_container_width=True, hide_index=True)
-            if st.button("✅ Записать как выполненное", key=f"csave_{iso_c}"):
-                gv = {}
-                for x in CL:
-                    cc_, phi_ = ds.item_dose(x)
-                    if cc_.group:
-                        gv[cc_.group] = round(gv.get(cc_.group, 0.0) + cc_.log_volume(phi_), 3)
-                ex_c = dict(LOGD.get(iso_c) or {})
-                ex_c.update({"sleep_score": int(sleep)})
-                if not ex_c.get("sore"):
-                    ex_c["sore"] = int(sore)
-                ex_c.update({"date": iso_c, "rest": False, "items": [{k: v for k, v in x.items() if k not in ("uid", "res_txt")} for x in CL], "groups": gv,
-                             "minutes": int(round(A["minutes"])), "rpe": round(A["AU"] / max(A["minutes"], 1), 2)})
-                if rpe_ov:
-                    ex_c["rpe_ovr"] = float(rpe_ov)
+            with st.expander("Подробности: вес, пулы, нагрузка по упражнениям, сравнение с планом", expanded=False):
+                if len(A["loads"]):
+                    st.markdown("**Вес: штанга и снаряды**")
+                    st.dataframe(A["loads"], use_container_width=True, hide_index=True)
+                    st.caption("Вес штанги и тоннаж влияют на модель только как нагрузка (утомление и фитнес). Связи «присед / жим → результат вида» в модели нет: она не выведена из ваших данных. "
+                               "Прогресс силы смотрите в «Тестах СФП» и по результатам самих видов.")
+                if "pools_now" in A and ST_REAL is not None:
+                    thr = ds.BioGates(ds.GateConfig(), model.const).cns_thr
+                    st.dataframe(pd.DataFrame({"Пул": ["ЦНС", "Метаболизм", "Механика"], "Сейчас": np.round(A["pools_now"], 2), "После тренировки": np.round(A["pools_after"], 2)})
+                                 .assign(**{"Порог ЦНС для «нервных» блоков": [round(float(thr), 2), None, None]}), use_container_width=True, hide_index=True)
                 else:
-                    ex_c.pop("rpe_ovr", None)
-                newlog = sorted([e for e in LOG if e["date"] != iso_c] + [ex_c], key=lambda e: e["date"])
-                new = dict(STATE)
-                new["log"] = newlog
-                new["widgets"] = dict(CUR_W) or STATE.get("widgets", {})
-                new["saved_at"] = _dt.datetime.now().isoformat(timespec="seconds")
-                st.session_state["_where"] = save_state(new)
-                st.session_state["_state"] = new
-                STATE.clear()
-                STATE.update(new)
-                st.rerun()
+                    st.caption("Состояние пулов неизвестно (мало записей в журнале) — шлюзы по текущему утомлению не проверялись.")
+                show = A["items"][["name", "cat", "dose", "minutes", "AU", "cns", "met", "mech", "gate"]].rename(columns={
+                    "name": "Упражнение", "cat": "Раздел", "dose": "Доза", "minutes": "Мин", "AU": "AU", "cns": "ЦНС", "met": "Метаб", "mech": "Механика", "gate": "Шлюз"})
+                st.dataframe(show, use_container_width=True, hide_index=True)
+                if planned_c:
+                    gsum = {}
+                    for x in CL:
+                        cc_, phi_ = ds.item_dose(x)
+                        if cc_.group:
+                            gsum[cc_.group] = gsum.get(cc_.group, 0.0) + cc_.log_volume(phi_)
+                    cmpr = [dict(Средство=ds.LOG_GROUPS[g][0], Единица=ds.LOG_GROUPS[g][1], План=round(float(v), 1), Выбрано=round(gsum.get(g, 0.0), 1)) for g, v in planned_c.items() if g in ds.LOG_GROUPS]
+                    if cmpr:
+                        st.markdown("**Сравнение с планом дня**")
+                        st.dataframe(pd.DataFrame(cmpr), use_container_width=True, hide_index=True)
+
 
 # ───────────────────────── сезон ─────────────────────────
 with tabs[3]:
@@ -5256,8 +6113,31 @@ with tabs[4]:
     c1.metric("Прогноз по плану", f"{F['sum_forecast']:.0f}")
     c2.metric("Если вместо плана — «типовая неделя» (заглушка)", f"{F['sum_typical']:.0f}", f"{F['sum_typical'] - F['sum_forecast']:+.0f} к плану")
     c3.metric("Совместимость профиля с популяцией (p)", f"{F['pval']:.2f}", f"d²={F['d2']:.1f}")
-    st.caption("Прогноз = ваши результаты × (1 ± отклик фитнеса и усталости на выбранный план). Отклик зависит от характеристик модели слева; "
+    st.caption("Прогноз = ваши результаты × (1 ± отклик фитнеса и усталости на выбранный план). Отклик зависит от характеристик модели («⚙️ Данные и модель → 🧠 Модель»); "
                "поскольку K и полураспады пока заложены по умолчанию, а не измерены на вашем журнале, это сценарий, а не измерение.")
+
+    st.markdown("#### 🛌 Что если пауза в подготовке")
+    st.caption("Те же дни плана, но на выбранный срок — полный отдых. Показано, как меняется форма в дни стартов. Фитнес в модели «живёт» 36–46 суток (настройка τ), поэтому ранняя пауза "
+               "почти забывается, а пауза за 1–2 месяца до старта — нет. Долгосрочную потерю базы модель не описывает: это ограничение модели, не вывод о физиологии.")
+    if df is None or not seq_dates:
+        st.info("Нужен план, чтобы считать сценарий.")
+    else:
+        _lo, _hi = max(real_today, pd.Timestamp(seq_dates[0])), pd.Timestamp(seq_dates[-1])
+        pz1, pz2 = st.columns(2)
+        pz_from = pz1.date_input("Пауза с", value=min(max(real_today + pd.Timedelta(days=1), _lo), _hi).date(), min_value=_lo.date(), max_value=_hi.date(), key="pz_from")
+        pz_days = pz2.number_input("Дней без тренировок", min_value=1, max_value=200, value=60, step=1, key="pz_days")
+        _sd = set(pd.Timestamp(x).normalize() for x in seq_dates)
+        _tgt = {}
+        for _nm, _d in (("Старт семиборья", d_hept), ("Старт десятиборья", d_dec)):
+            _dd = _d.normalize() if _d.normalize() in _sd else (_d - pd.Timedelta(days=1)).normalize()
+            if _dd in _sd:
+                _tgt[_nm] = _dd
+        PZ = ds.pause_scenario(df, real_today, pd.Timestamp(pz_from), int(pz_days), _tgt, RES_F, float(ath_mass), model, ST_REAL, LAST if ST_REAL is not None else None)
+        if len(PZ):
+            PZ = PZ.rename(columns={"target": "Старт", "date": "Дата", "plan": "Форма по плану, очки", "pause": "Форма с паузой, очки", "delta": "Δ очков"})
+            st.dataframe(PZ, use_container_width=True, hide_index=True)
+            st.caption("Очки — по шкале десятиборья на этот день: для даты семиборья это «форма на эту дату», а не прогноз семиборья (в модели нет его видов). "
+                       "Главное — разность Δ: сколько формы стоит такая пауза.")
 
     st.markdown("#### Монте-Карло турнира (2 дня, попытки, заступы, планка)")
     cc = st.columns(6)
@@ -5352,7 +6232,7 @@ with tabs[7]:
 
 # ───────────────────────── профили ─────────────────────────
 with tabs[8]:
-    REF7500 = {"100m": 11.32, "LJ": 7.13, "SP": 13.70, "HJ": 1.96, "400m": 50.90, "110mH": 15.20, "DT": 41.80, "PV": 4.40, "JT": 56.80, "1500m": 283.0}
+    REF7500 = dict(ds.REF_PROFILE)
     REF7850 = {"100m": 11.20, "LJ": 7.25, "SP": 14.20, "HJ": 2.02, "400m": 50.20, "110mH": 14.90, "DT": 43.50, "PV": 4.60, "JT": 59.00, "1500m": 281.0}
     p75 = {e: calc_pts(e, v) for e, v in REF7500.items()}
     p78 = {e: calc_pts(e, v) for e, v in REF7850.items()}
@@ -5366,16 +6246,112 @@ with tabs[8]:
 
 # ───────────────────────── тесты ─────────────────────────
 with tabs[9]:
-    st.subheader("Тесты СФП по таблице Нариманова")
-    if not has_tests:
-        st.info("Отметьте «Тесты замерены лично» в боковой панели и введите реальные значения.")
+    st.subheader("Тесты СФП и потенциал")
+    st.caption("Тесты берутся из журнала сами (лучший за 120 дней) и сопоставляются с таблицей Нариманова; из профиля — только если отмечено «Тесты замерены лично». "
+               "Ядро учитывается только весом 7,26 кг; Vmax = 30 м / время с хода; жим — оценка 1ПМ по формуле Эпли (вес × (1 + повторы/30)).")
+    LV = [7000, int(sum_cur), 7500, 8000]
+    ref_rows = []
+    for k_, sp_ in ds.SFP_TESTS.items():
+        arr_ = ds.NAR[k_][0]
+        ref_rows.append({"Тест": sp_["label"], **{f"≈{L_}": round(float(np.interp(L_, ds.NAR_LEVELS, arr_)), 2) for L_ in LV}})
+    ref_rows.append({"Тест": "КД-2", **{f"≈{L_}": round(float(np.interp(L_, ds.NAR_LEVELS, ds.NAR["KD2"][0])), 2) for L_ in LV}})
+    st.markdown(f"**Какие значения соответствуют уровню** (колонка ≈{int(sum_cur)} — ваша сумма личных результатов; реальный турнир обычно ниже на ≈{loss_n})")
+    st.dataframe(pd.DataFrame(ref_rows), use_container_width=True, hide_index=True)
+    if not len(TEST_ASSESS):
+        st.info("Ваших тестов Нариманова пока нет. Внесите их в «Сегодня → Моя тренировка»: «Тест: ядро 7,26 кг назад через голову», «Тест: тройной прыжок с места», «Тест: бег 30 м с хода», "
+                "«Контрольный бег 1000 м», «Жим лёжа» (вес и повторы) — отсюда они подхватятся сами. Либо вручную: «⚙️ Данные и модель → 👤 Профиль» → «Тесты замерены лично».")
     else:
-        vals = {"Vmax (м/с)": v_max, "Тройной с места (м)": t_triple, "Бросок ядра назад (м)": t_shot, "Жим лёжа (кг)": t_bench, "Бег 1000 м (с)": t_1000}
-        rows = [{"Тест": k, "Ваш замер": v, "Уровень 7500": NARUI[k][4], "Уровень 8000": NARUI[k][5], "Уровень по таблице": round(interp_level(NARUI[k], v))} for k, v in vals.items()]
+        rows = [{"Тест": r_.label, "Замер": round(r_.value, 2), "Источник": TEST_SRC.get(r_.test, ""), "Уровень по таблице": round(r_.level_test),
+                 "Уровень связанных видов": round(r_.level_events), "Разница": f"{r_.gap:+.0f}", "Вывод": r_.verdict} for r_ in TEST_ASSESS.itertuples()]
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-        weak = min(rows, key=lambda x: x["Уровень по таблице"])
-        st.info(f"КД-2 = **{kd2v:.2f}** (уровень 7500 = 45.50), по интерполяции таблицы ≈ **{interp_level(KD2_TAB, kd2v):.0f}**. Слабее всего: **{weak['Тест']}** (≈{weak['Уровень по таблице']}). "
-                "Это интерполяция, а не оценка ВНИИФК; тесты скорости и силы не говорят о технике.")
+        txt_ = []
+        if kd2v is not None:
+            txt_.append(f"КД-2 = **{kd2v:.2f}** (уровень 7500 = 45,50), по интерполяции таблицы ≈ **{interp_level(KD2_TAB, kd2v):.0f}**.")
+        wk_ = TEST_ASSESS.sort_values("gap").iloc[0]
+        txt_.append(f"Самый отстающий от результата тест: **{wk_.label}** ({wk_.gap:+.0f}).")
+        if T_MULT:
+            txt_.append("В плане из-за этого изменены акценты: " + ", ".join(f"{GL.get(g, g)} ×{m:.2f}" for g, m in T_MULT.items()) + ".")
+        elif not use_tests_emph:
+            txt_.append("Влияние на акценты плана выключено в настройках.")
+        else:
+            txt_.append("Расхождений ≥ 500 очков нет — акценты плана по тестам не менялись.")
+        st.info(" ".join(txt_))
+        st.caption("«Уровень связанных видов» = 7500 × очки вида / очки вида в моём условном профиле 7500 (мой перевод, не из литературы). Разница ≤ −500: рост результата упирается в физическую базу — "
+                   "тянет сила/СФП; ≥ +500: база опережает результат — резерв в технике и реализации. Это ориентир для выбора акцентов, а не измерение потолка. "
+                   "Тесты скорости и силы не говорят о технике.")
+
+    st.markdown("#### Функция «тест → результат вида» (Грузенкин)")
+    GR_ = ds.grz_ratios()
+    LBL_ = {"SP_bwd": "Ядро: бросок назад → толчок", "SP_stand": "Ядро: толчок с места → толчок", "DT_stand": "Диск: бросок с места → диск"}
+    st.dataframe(pd.DataFrame([{"Связь": LBL_[r_.pair], "До эксперимента": round(r_.ratio_before, 3), "После": round(r_.ratio_after, 3), "Среднее": round(r_.ratio, 3),
+                                "Коридор": f"{r_.lo:.3f}…{r_.hi:.3f}"} for r_ in GR_.itertuples()]), use_container_width=True, hide_index=True)
+    st.caption("Откуда: автореферат диссертации Грузенкина (1990). Табл. 1 — средние тесты группы (до эксперимента и лучшие за период), табл. 4 — личные рекорды шести спортсменов до эксперимента и лучшие результаты 1988 г. "
+               "(суммы сверены с табл. 5: 7647,5 → 7859,0). Отношение = средний результат вида / средний тест, «лучший против лучшего» до и после. Оно почти не меняется "
+               "(у ядра назад 0,89 → 0,91, у диска 1,12 → 1,13), поэтому это устойчивая связь для мастеров ≈7650–7860. Коридор ±4 % — МОЁ допущение: по двум точкам и шести людям разброс не оценить. "
+               "Это групповые средние, а не ваша индивидуальная зависимость; вес снарядов в тестах в источнике не указан (принято 7,26 кг и 2 кг).")
+    if len(TEST_RES):
+        trr_ = [{"Тест": ds.THROW_TESTS[r_.test]["label"] if r_.test in ds.THROW_TESTS else ds.SFP_TESTS[r_.test]["label"], "Замер": round(r_.value, 2), "Ожидаемый результат вида": f"{r_.exp_lo:.2f}…{r_.exp_hi:.2f} (≈{r_.exp_mid:.2f})",
+                 "Ваш результат": round(r_.current, 2), "Разница, м": f"{r_.d_m:+.2f}", "Разница, очков": f"{r_.d_pts:+.0f}",
+                 "Вывод": ("результат ниже теста: резерв в технике и реализации" if r_.d_pts >= 50 else ("результат выше теста: упираетесь в силу" if r_.d_pts <= -50 else "соответствует"))}
+                for r_ in TEST_RES.itertuples()]
+        st.dataframe(pd.DataFrame(trr_), use_container_width=True, hide_index=True)
+    else:
+        st.info("Нужен хотя бы один замер из трёх: бросок ядра назад 7,26 кг, толчок ядра с места, бросок диска с места (категория «Контроль» / «Ядро» / «Диск» в «Моя тренировка»).")
+    st.markdown("**Что если** (введите значение теста, получите ожидаемый результат вида; 0 — не считать)")
+    wc1, wc2, wc3 = st.columns(3)
+    wi_ = {"SP_bwd": wc1.number_input("Ядро назад 7,26 кг, м", 0.0, 22.0, 0.0, 0.1, key="wi_bwd"),
+           "SP_stand": wc2.number_input("Толчок ядра с места, м", 0.0, 20.0, 0.0, 0.1, key="wi_put"),
+           "DT_stand": wc3.number_input("Диск с места 2 кг, м", 0.0, 65.0, 0.0, 0.5, key="wi_dt")}
+    wrows_ = []
+    for k_, v_ in wi_.items():
+        if v_ > 0:
+            ev_ = ds.GRZ_COUPLE[k_][0]
+            lo_, mid_, hi_ = ds.expected_from_test(k_, float(v_))
+            wrows_.append({"Тест": LBL_[k_].split(" → ")[0], "Значение": v_, "Ожидаемо": f"{lo_:.2f}…{hi_:.2f} (≈{mid_:.2f})", "Ваш результат": res[ev_],
+                           "Очков, если выйдете на ≈": f"{float(ds.wa_points(ev_, mid_)) - float(ds.wa_points(ev_, res[ev_])):+.0f}"})
+    if wrows_:
+        st.dataframe(pd.DataFrame(wrows_), use_container_width=True, hide_index=True)
+        st.caption("Это ожидание для мастера уровня группы Грузенкина. Если полный результат у вас ниже, значит, разрыв в технике или в реализации теста; он закрывается не прибавкой силы. "
+                   "Рывок, жим и присед в функцию не входят: у Грузенкина для них есть только групповые средние (рывок +6,9 кг и ядро +0,67 м за сезон шли вместе), из двух точек зависимость не вывести.")
+    else:
+        _e1, _e2, _e3 = ds.expected_from_test("DT_stand", 33.0), ds.expected_from_test("SP_stand", 13.0), ds.expected_from_test("SP_bwd", 15.0)
+        st.caption(f"Пример: диск с места 33 м → ожидаемо {_e1[0]:.1f}…{_e1[2]:.1f} м (≈{_e1[1]:.1f}); ядро с места 13 м → {_e2[0]:.1f}…{_e2[2]:.1f} м; ядро назад 15,0 м → {_e3[0]:.1f}…{_e3[2]:.1f} м. "
+                   "Рывок, жим и присед в функцию не входят: у Грузенкина для них есть только групповые средние, зависимость из них не вывести.")
+
+    st.markdown("#### Потенциал к старту десятиборья")
+    H_G = max(0, (d_dec - real_today).days)
+    cg1, cg2 = st.columns(2)
+    pause_d = cg1.number_input("Дней без тренировок до старта", min_value=0, max_value=max(H_G, 1), value=int(min(GAP_DAYS, H_G)), step=1, key="pot_pause",
+                               help="По умолчанию — текущая пауза в журнале. Двигайте: сколько ещё дней вы не будете тренироваться.")
+    plan_sh = cg2.slider("Доля плана, которую выполню", 0.5, 1.0, 1.0, 0.05, key="pot_share")
+    GF = ds.growth_forecast(res, H_G, int(pause_d), float(plan_sh), float(loss_n), STRETCH_UI, TEST_ASSESS if len(TEST_ASSESS) else None, FGAP)
+    GF0 = ds.growth_forecast(res, H_G, 0, float(plan_sh), float(loss_n), STRETCH_UI, TEST_ASSESS if len(TEST_ASSESS) else None, FGAP)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Норма роста на срок (Хейнла)", f"{GF['budget'][0]:.0f}…{GF['budget'][1]:.0f}", f"{H_G} дн. до старта")
+    m2.metric("Сумма личных к старту", f"{GF['sum_lo']:.0f}…{GF['sum_hi']:.0f}", f"сейчас {GF['sum_pr']:.0f}")
+    m3.metric("Турнир (с потерей)", f"{GF['tour_lo']:.0f}…{GF['tour_hi']:.0f}", f"−{loss_n}")
+    m4.metric("Недобор из-за пауз/невыполнения", f"{GF0['sum_hi'] - GF['sum_hi']:.0f}", f"доля времени {GF['share']:.0%}")
+    tg = GF["table"].copy()
+    tg["Вид"] = tg["event"].map(RU)
+    tg["Ожидаемый результат"] = [(f"{min(a_, b_):.2f}" if f"{a_:.2f}" == f"{b_:.2f}" else f"{min(a_, b_):.2f}…{max(a_, b_):.2f}") for a_, b_ in zip(tg["result_lo"], tg["result_hi"])]
+    tg["+ очков"] = [f"{a_:.0f}…{b_:.0f}" for a_, b_ in zip(tg["gain_lo"], tg["gain_hi"])]
+    st.dataframe(tg.rename(columns={"current": "Сейчас", "pts_now": "Очки", "reserve": "Запас до потолка"})[["Вид", "Сейчас", "Очки", "Ожидаемый результат", "+ очков", "Запас до потолка"]],
+                 use_container_width=True, hide_index=True)
+    st.caption("Величина роста — норма Хейнлы для вашего класса, пересчитанная на срок (≈300–325 очков за сезон до 7300), и она подходит только при нормальной подготовке. "
+               "МОИ допущения: рост уменьшается линейно с долей времени без тренировок и невыполненной частью плана; распределяется по видам пропорционально запасу до «потолка» "
+               "(потолки — мои, правятся в «Цель → результаты»), у видов с запасом в технике вес ×1,15, где сила отстаёт — ×0,85. Это ожидание, а не гарантия: разброс между спортсменами большой "
+               "(SD прироста в литературе ≈ 190 очков за 2 сезона). От формы на день старта (вкладка «Прогноз») это отдельно: там рассчитана форма относительно рекордов.")
+    ctrl_ = [d_ for d_ in ("2026-10-14", "2026-12-23", "2027-02-17", "2027-05-12") if pd.Timestamp(d_) >= real_today]
+    if TEST_VALS and ctrl_:
+        TT = ds.test_targets(TEST_VALS, real_today, real_today, d_hept, ctrl_)
+        if len(TT):
+            piv = TT.pivot(index="label", columns="date", values="target").round(2)
+            piv.insert(0, "Сейчас", TT.groupby("label")["now"].first().round(2))
+            piv.columns = [(f"{c_[8:10]}.{c_[5:7]}" if c_ != "Сейчас" else c_) for c_ in piv.columns]
+            st.markdown("**Ориентиры на контрольные дни**")
+            st.dataframe(piv, use_container_width=True)
+            st.caption("Рост от сегодняшнего замера до конца подготовительного периода (старт семиборья) на ту же долю, на какую выросла средняя группа Грузенкина "
+                       "(ядро назад +5,3 %, тройной +4,2 %, жим +12 %, Vmax +3,3 %); линейность — моё допущение. Группа сильнее вас — для вас это ориентир, не норма.")
     st.markdown("#### Динамика тестов за подготовительный период (Грузенкин, средняя группа МС СССР)")
     gz = pd.DataFrame([
         {"Тест": "Рывок штанги (кг)", "Начало": 80.3, "Конец": 87.2}, {"Тест": "Жим лёжа (кг)", "Начало": 106.8, "Конец": 119.6},
@@ -5397,13 +6373,13 @@ with tabs[10]:
         ["Полураспады, τ, K1, K2, насыщение", "прогноз по плану и пометки шлюзов в плане; состав плана не меняют"],
         ["Вес", "штраф 1500 м во 2-й день в модели; КД-2"],
         ["Давность замеров", "усадка профиля (сколько данные «пробивают» популяцию)"],
-        ["Сон и боль (боковая панель)", "облегчённый вариант на сегодня (пороги условные)"],
+        ["Сон и боль (вкладка «Сегодня»)", "облегчённый вариант на сегодня и допуск при анализе тренировки (пороги условные)"],
         ["Записи журнала", "нагрузка, ACWR, выполнение плана; ДОБОР недовыполненного в плане; состояние пулов и шлюзы от реального журнала; прогноз стартует от реального состояния; подбор T½ ЦНС"],
         ["Потери «личные − турнир»", "консервативная оценка, вкладки «Хейнла» и «Цель → результаты»"]], columns=["Параметр", "Что пересчитывается"]),
         use_container_width=True, hide_index=True)
     with st.expander("Как в модели считается «утомление ЦНС»"):
         st.markdown(ds.CNS_EXPLAIN)
-    st.subheader("Характеристики модели (то, что вы двигаете слева)")
+    st.subheader("Характеристики модели (то, что вы двигаете в «⚙️ Данные и модель → 🧠 Модель»)")
     hl = pd.DataFrame({"Пул": list(F["half_life"].keys()), "T½ сейчас, ч": [round(v, 1) for v in F["half_life"].values()],
                        "T½ старт, ч": [round(v, 1) for v in F0["half_life"].values()]})
     st.dataframe(hl, use_container_width=True, hide_index=True)
@@ -5422,19 +6398,11 @@ with tabs[11]:
     st.subheader("История результатов")
     st.caption("Нажмите кнопку, когда обновили результаты: срез запомнится с датой (повторное нажатие в тот же день заменяет срез). "
                "По срезам видно, как менялась сумма личных результатов.")
-    if st.button("📌 Сохранить срез результатов сегодня"):
-        snap = {"date": str(_dt.date.today()), "res": {e: float(res[e]) for e in EV}, "hep": {k: float(v) for k, v in hep.items()},
+    if st.button("📌 Сохранить срез результатов сегодня", type="primary"):
+        snap = {"date": str(real_today.date()), "res": {e: float(res[e]) for e in EV}, "hep": {k: float(v) for k, v in hep.items()},
                 "sum": int(sum_cur), "sum_hep": int(sum_hep), "mass": float(ath_mass), "forecast": float(F["sum_forecast"])}
         hist = [h for h in STATE.get("history", []) if h.get("date") != snap["date"]] + [snap]
-        new = dict(STATE)
-        new["history"] = sorted(hist, key=lambda h: h["date"])
-        new["widgets"] = dict(CUR_W) or STATE.get("widgets", {})
-        new["saved_at"] = _dt.datetime.now().isoformat(timespec="seconds")
-        st.session_state["_where"] = save_state(new)
-        st.session_state["_state"] = new
-        STATE.clear()
-        STATE.update(new)
-        st.success("Срез сохранён: " + ", ".join(st.session_state["_where"] or ["нигде — скачайте копию в боковой панели"]))
+        commit(dict(STATE, history=sorted(hist, key=lambda h: h["date"])), f"Срез результатов за {real_today:%d.%m} сохранён")
     H = STATE.get("history", [])
     if not H:
         st.info("Срезов пока нет.")
@@ -5445,21 +6413,23 @@ with tabs[11]:
         if len(hdf) > 1:
             st.line_chart(hdf.set_index("Дата")[["Сумма 10 видов"]])
         if st.button("Удалить последний срез"):
-            new = dict(STATE)
-            new["history"] = H[:-1]
-            st.session_state["_where"] = save_state(new)
-            st.session_state["_state"] = new
-            STATE.clear()
-            STATE.update(new)
-            st.rerun()
-
+            commit(dict(STATE, history=H[:-1]), "Последний срез удалён")
 
 # ───────────────────────── журнал ─────────────────────────
 with tabs[1]:
-    st.subheader("📝 Журнал: что вы сделали")
-    st.caption("Введите день — приложение пересчитает нагрузку, выполнение плана, состояние по модели и прогноз. Записи сохраняются вместе с остальными данными. "
-               "Дни без записи считаются днями отдыха; если день был без тренировки, так и отметьте.")
-    jd = st.date_input("Дата записи", value=real_today.date(), max_value=real_today.date(), key="j_date")
+    st.subheader(f"📝 Запись дня: {cur_date:%d.%m.%Y}")
+    st.caption("День выбирается вверху страницы (стрелки «◀ день» / «день ▶» или календарь). Здесь — чек-ин (сон, пульс, HRV…), заметка и запись без каталога упражнений. "
+               "Тренировку с упражнениями и результатами удобнее собирать во вкладке «🏠 Сегодня». Дни без записи модель считает днями отдыха.")
+    _rec_days = sorted({e["date"] for e in LOG}, reverse=True)[:7]
+    if _rec_days:
+        st.markdown("**Недавно записанные дни** — нажмите, чтобы открыть:")
+        _rc = st.columns(len(_rec_days))
+        for _i, _d in enumerate(_rec_days):
+            _rc[_i].button(("✅ " if _d != str(cur_date.date()) else "▶ ") + pd.Timestamp(_d).strftime("%d.%m"), on_click=_goto, args=(_d,), key=f"j_open_{_d}", use_container_width=True)
+    jd = cur_date.date()
+    j_can = cur_date <= real_today
+    if not j_can:
+        st.info("Это будущий день: записать можно только сегодняшний и прошедшие дни.")
     iso = str(jd)
     ex = LOGD.get(iso)
     prow = df_base[df_base["date"] == pd.Timestamp(jd)] if df_base is not None else pd.DataFrame()
@@ -5492,30 +6462,18 @@ with tabs[1]:
     note_ = st.text_input("Заметка", value=(ex or {}).get("notes", ""), key=f"j_nt_{iso}")
     b1, b2 = st.columns(2)
     if ex and ex.get("items"):
-        st.info("Этот день записан через конструктор («Сегодня»): упражнения и результаты редактируйте там. Здесь сохраняются только чек-ин и заметка.")
-    if b1.button("💾 Сохранить день", key="j_save"):
+        st.info("Этот день записан через конструктор («🏠 Сегодня»): упражнения и результаты редактируйте там. Здесь сохраняются только чек-ин и заметка.")
+    if b1.button("💾 Сохранить день", type="primary", disabled=not j_can, key="j_save", use_container_width=True):
         rec = {"date": iso, "rest": bool(rest_), "groups": {g: float(v) for g, v in vols.items() if v > 0}, "minutes": int(minutes), "rpe": int(rpe),
                "sleep_h": sleep_h or None, "sore": sore_ or None, "rhr": rhr_ or None, "hrv": hrv_ or None, "cmj": cmj_ or None, "mass": mass_ or None, "notes": note_}
         if ex and ex.get("items"):
             rec.update({k: ex[k] for k in ("items", "groups", "minutes", "rpe", "rpe_ovr", "rest") if k in ex})
         newlog = sorted([e for e in LOG if e["date"] != iso] + [rec], key=lambda e: e["date"])
-        new = dict(STATE)
-        new["log"] = newlog
-        new["widgets"] = dict(CUR_W) or STATE.get("widgets", {})
-        new["saved_at"] = _dt.datetime.now().isoformat(timespec="seconds")
-        st.session_state["_where"] = save_state(new)
-        st.session_state["_state"] = new
-        STATE.clear()
-        STATE.update(new)
-        st.rerun()
-    if ex and b2.button("🗑 Удалить запись за эту дату", key="j_del"):
-        new = dict(STATE)
-        new["log"] = [e for e in LOG if e["date"] != iso]
-        st.session_state["_where"] = save_state(new)
-        st.session_state["_state"] = new
-        STATE.clear()
-        STATE.update(new)
-        st.rerun()
+        commit(dict(STATE, log=newlog), f"День {jd:%d.%m} сохранён")
+    if ex:
+        _conf = b2.checkbox("Подтверждаю удаление записи", key=f"j_delok_{iso}")
+        if b2.button("🗑 Удалить запись за эту дату", disabled=not _conf, key="j_del", use_container_width=True):
+            commit(dict(STATE, log=[e for e in LOG if e["date"] != iso]), f"Запись за {jd:%d.%m} удалена")
     if LOG:
         st.markdown("#### Последние записи")
         auby = ds.log_daily_au(LOG, real_today).assign(d=lambda x: x["date"].dt.strftime("%Y-%m-%d")).set_index("d")["AU"]
@@ -5530,7 +6488,7 @@ with tabs[2]:
     with st.expander("Как в модели считается «утомление ЦНС» (честно: что это и чем не является)"):
         st.markdown(ds.CNS_EXPLAIN)
     if not LOG or "daily" not in AN:
-        st.info("Журнал пуст. Внесите хотя бы несколько дней на вкладке «Журнал». Анализ нагрузки заработает с 14 дней, состояние по модели — с 7, подбор T½ ЦНС — с 21 дня чек-инов.")
+        st.info("Журнал пуст. Внесите хотя бы несколько дней: «🏠 Сегодня» или «📓 Дневник → Запись дня». Анализ нагрузки заработает с 14 дней, состояние по модели — с 7, подбор T½ ЦНС — с 21 дня чек-инов.")
     else:
         a1_, a2_, a3_, a4_ = st.columns(4)
         a1_.metric("Нагрузка за 7 дней (мин×RPE)", f"{AN.get('week_au', 0):.0f}")
@@ -5595,8 +6553,27 @@ with tabs[2]:
         if use_adj:
             notes_.append("прогноз сдвинут по тренду (k=" + f"{adj_k:g}" + "): " + ", ".join(f"{e} {res[e]:.2f}→{RES_F[e]:.2f}" for e in res if abs(RES_F[e] - res[e]) > 1e-9))
         st.caption("Тренд — наклон Тейла–Сена лучших результатов за 8 недель, % за 4 недели (плюс = лучше). Порог «растёт/падает» ±0,8 % — мой; при 3–4 точках это ориентир, не вывод. "
-                   + ("; ".join(notes_) if notes_ else "Учёт в плане и прогнозе отключён в боковой панели."))
+                   + ("; ".join(notes_) if notes_ else "Учёт в плане и прогнозе отключён в «⚙️ Данные и модель → 🔧 Правила плана»."))
     st.markdown("#### 🏅 Результаты на тренировках (секунды, метры, высота)")
+    _pcs = ds.pr_candidates(LOG, res)
+    if len(_pcs):
+        st.markdown("**Лучше результата в вашем профиле** — только полные виды с соревновательным снарядом (метание с места, тесты и силовые сюда не входят):")
+        render_pr(_pcs, "dn")
+    else:
+        st.caption("Результатов полных видов, лучших вашего профиля, в журнале нет. Сюда попадают только полные броски/прыжки/забеги с соревновательным снарядом; "
+                   "метание с места, тесты и силовые связаны с результатом вида иначе — их прямо в профиль не переношу.")
+    _pr = ds.pair_ratio(LOG, res)
+    if len(_pr):
+        st.markdown("**С места → полный: ваши пары** (простое упражнение и полный бросок/прыжок того же вида в пределах 3 дней)")
+        _pt = _pr.copy()
+        _pt["Вид"] = _pt["event"].map(RU)
+        _pt["Вывод"] = [("нужно ≥ 2 пар с полным результатом — перевести нельзя" if e_ is None or pd.isna(e_) else
+                         (f"≈ {e_:.2f} м полного — выше вашего {p_:.2f}: проверьте полным броском" if e_ > p_ else f"≈ {e_:.2f} м полного — ниже вашего {p_:.2f}"))
+                        for e_, p_ in zip(_pt["estimate"], _pt["pr"])]
+        st.dataframe(_pt.rename(columns={"exercise": "Упражнение", "pairs": "Пар", "ratio": "Простое / полное", "last_date": "Последний раз", "last_value": "Результат"})
+                     [["Вид", "Упражнение", "Пар", "Простое / полное", "Последний раз", "Результат", "Вывод"]].round(3), use_container_width=True, hide_index=True)
+        st.caption("Коэффициент считается по ВАШИМ парам (медиана отношений), чужих коэффициентов из литературы я не подставляю: у разных людей он разный. Оценка полного — "
+                   "ориентир для решения, в профиль и прогноз сама не попадает.")
     PBT = ds.pb_table(LOG)
     if PBT.empty:
         st.caption("Пока нет записей с результатами: в «Сегодня» → «Моя тренировка» введите время/дальность/высоту по попыткам и запишите день.")
@@ -5675,7 +6652,27 @@ with tabs[12]:
         gl = sorted(set(EMPH_HEAD) | set(EMPH_LAWD))
         st.markdown("**Множители объёма по средствам**")
         st.dataframe(pd.DataFrame({"Средство": [GL.get(g, g) for g in gl], "По запасу роста": [round(EMPH_HEAD.get(g, 1.0), 2) for g in gl],
-                                   "По закону убывающей отдачи": [round(EMPH_LAWD.get(g, 1.0), 2) for g in gl], f"Итог (вес закона {w_hours:g})": [round(EMPH.get(g, 1.0), 2) for g in gl]}),
+                                   "По закону убывающей отдачи": [round(EMPH_LAWD.get(g, 1.0), 2) for g in gl], "Слабое звено (тесты)": [round(T_MULT.get(g, 1.0), 2) for g in gl],
+                                   f"Итог (вес закона {w_hours:g})": [round(EMPH.get(g, 1.0), 2) for g in gl]}),
                      use_container_width=True, hide_index=True)
 
 persist_now()
+
+# ───────────────────────── боковая панель: что с сохранением ─────────────────────────
+with SIDE_STATUS:
+    st.markdown("### 🏃 Самандык Д.В.")
+    _cloud = bool(_secret("SUPABASE_URL") and _secret("SUPABASE_KEY"))
+    _err = st.session_state.get("_save_err")
+    if _cloud and not _err:
+        st.success("☁️ Облако настроено: записи переживают перезапуск")
+    elif _cloud:
+        st.warning("☁️ Облако настроено, но последняя запись туда не прошла: " + str(_err))
+    else:
+        st.error("☁️ Облако не подключено: после перезапуска сервера записи пропадут. Подключите (DEPLOY.md) или скачивайте копию.")
+    _sa = STATE.get("saved_at")
+    st.caption("Последнее сохранение: " + (pd.Timestamp(_sa).strftime("%d.%m %H:%M") if _sa else "ещё не было"))
+    st.caption(f"Дней в дневнике: {len(LOG)}" + (f" · последний {max(e['date'] for e in LOG)}" if LOG else ""))
+    st.caption("Настройки сохраняются сами при каждом изменении. Записи дневника — по кнопкам «Записать».")
+    st.markdown("---")
+    st.metric("Прогноз модели к старту", f"{F['sum_forecast']:.0f}", f"{F['sum_forecast'] - F0['sum_forecast']:+.0f} к эталону")
+    st.caption(f"До семиборья {max(0, (d_hept - real_today).days)} дн. · до десятиборья {max(0, (d_dec - real_today).days)} дн.")
