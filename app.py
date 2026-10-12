@@ -3500,27 +3500,142 @@ def test_targets(tests: Dict[str, float], today, prep_start, prep_end, dates: Se
     return pd.DataFrame(rows, columns=["test", "label", "date", "target", "now"])
 
 
+# ═════════════════════════════ 9k. СИНТЕЗ КОРРЕЛЯЦИЙ «ТЕСТ × ВИД» ИЗ ЛИТЕРАТУРЫ (поиск в интернете, 12.10.2026) ═════════════════════════════
+# Прямых работ «силовой/прыжковый тест ↔ результат вида у десятиборцев» найти не удалось. Что нашлось и как использовано:
+#  • СВЯЗИ МЕЖДУ ВИДАМИ: arXiv 2602.17043 (2026), табл. A7 — 8668 десятиборий 1007 спортсменов 2001–2022 (≥6400 очков). Это самая большая выборка; проверено двумя прочтениями.
+#  • ТЕСТЫ У СПЕЦИАЛИСТОВ (корреляции с результатом ИХ вида): Judge & Bellar 2012 (ядро, n=53; жим .767, присед .771, взятие на грудь .868, частные r с поправкой на пол);
+#    Maeda и др. 2024 (молот, женщины, n=82; рывок .79, присед .69, жим .56, тройной с места .61, прыжок с места .40, бросок ядра назад 4 кг .61, бег 30 м −.10 по времени; значения из таблицы 2,
+#    в тексте статьи для приседа .59 — расхождение); Abd Rahim и др. 2020 (длина, n=30 студентов; присед .906, прыжок с места .892, прыжок вверх .557, бег 30 м −.598);
+#    Reis и др. 2006 (длина, n=45 новичков); Zhou & Kang (длина, n=33, скорость разбега .84); Loturco 2015 (100 м, n=14, SJ −.82, CMJ −.85, прыжок с места −.81), Mackala 2015 (n=11), Almuzaini 2008 (n=38);
+#    Healy 2022 (100 м, n=82, Vmax r ≥ .90 по модулю); Lin и др. 2023 (мета-анализ: прыжок с места ↔ скорость 30–100 м −.73).
+#  • СВЯЗИ ТЕСТОВ МЕЖДУ СОБОЙ: Guthrie 2021 (жим ↔ присед .56, n=663; прыжок вверх ↔ с места .64, n=160); Graham-Smith & Brice (элитные прыгуны, R² CMJ ↔ прыжок с места .76).
+#  • Единственные данные о десятиборцах: Романов 2018 (100 сильнейших; масса тела ↔ ядро .42, диск .36, сумма .29) — показываются отдельно.
+#  • НЕ ПРОЧИТАНО: PLOS ONE 0295083 (сервер отказал по лимиту запросов), PMC и PubMed (капча) — из них ничего не взято.
+# ЧТО МОЁ: (1) относительная пригодность выборки (rel) — специалисты с широким диапазоном результата завышают корреляцию для десятиборцев, у которых диапазон уже; (2) стягивание каждой клетки
+# к слабой априорной r = 0,30 с весом «15 наблюдений»; (3) клетки без данных: «по аналогии» (ядро назад, толчок и диск с места ← бросок назад у молота .61; 1000 м ← VO₂max .85, R² = .72, Bliss 2021)
+# и «через вид» (r теста с его «домашним» видом × связь вида с данным видом); (4) ρ между тестами одного вида = 0,55 (Guthrie .56/.64).
+LIT3_ROWS = {   # табл. A7 arXiv 2602.17043: корреляции РЕЗУЛЬТАТОВ (время: меньше = лучше), порядок EVENTS; строка → значения против видов справа
+    "100m": [-.54, -.20, -.20, .66, .52, -.18, -.25, -.13, .10], "LJ": [.33, .43, -.45, -.47, .29, .34, .24, -.14], "SP": [.31, -.15, -.36, .73, .38, .51, -.01],
+    "HJ": [-.21, -.34, .28, .29, .22, -.10], "400m": [.46, -.13, -.25, -.11, .46], "110mH": [-.32, -.37, -.24, .12], "DT": [.40, .48, -.02], "PV": [.31, -.20], "JT": [-.09]}
+LIT3_N_ATHLETES, LIT3_N_PERF = 1007, 8668
+
+
+def lit3_corr_results() -> np.ndarray:
+    C = np.eye(10)
+    for ev, vals in LIT3_ROWS.items():
+        i = EVENTS.index(ev)
+        for k, r in enumerate(vals):
+            C[i, i + 1 + k] = C[i + 1 + k, i] = r
+    return C
+
+
+def lit3_corr_points() -> np.ndarray:
+    """Корреляции ОЧКОВ между видами (у времён знак меняется) — арXiv 2026, 1007 десятиборцев. Это связи МЕЖДУ спортсменами (срез), а не разброс одного спортсмена в турнире."""
+    s = _sgn(EVENTS)
+    return lit3_corr_results() * np.outer(s, s)
+
+
+# (тест, вид, r в ориентации «выше результат теста → лучше результат вида», n, пригодность rel (МОЁ), вид записи: d — прямая, a — по аналогии, источник)
+LIT_TEST_R = [
+    ("snatch", "SP", .868, 53, .45, "d", "Judge & Bellar 2012, взятие на грудь как замена рывка"),
+    ("bench", "SP", .767, 53, .50, "d", "Judge & Bellar 2012"), ("squat", "SP", .771, 53, .50, "d", "Judge & Bellar 2012"),
+    ("snatch", "DT", .79, 82, .40, "d", "Maeda 2024, молот (жен.) → диск"), ("bench", "DT", .56, 82, .40, "d", "Maeda 2024"), ("squat", "DT", .69, 82, .40, "d", "Maeda 2024"),
+    ("triple_sj", "DT", .61, 82, .40, "d", "Maeda 2024"), ("slj", "DT", .40, 82, .40, "d", "Maeda 2024"), ("fly30", "DT", .10, 82, .40, "d", "Maeda 2024 (30 м по времени −.10)"),
+    ("shot_bwd", "DT", .61, 82, .40, "d", "Maeda 2024, бросок ядра назад 4 кг"),
+    ("squat", "LJ", .906, 30, .35, "d", "Abd Rahim 2020, студенты (одна малая выборка — сомнительно высоко)"), ("slj", "LJ", .892, 30, .35, "d", "Abd Rahim 2020"),
+    ("cmj", "LJ", .557, 30, .35, "d", "Abd Rahim 2020"), ("fly30", "LJ", .598, 30, .35, "d", "Abd Rahim 2020 (30 м по времени −.598)"),
+    ("fly30", "LJ", .54, 45, .25, "d", "Reis 2006, новички (20 м с хода)"), ("slj", "LJ", .45, 45, .25, "d", "Reis 2006"), ("triple_sj", "LJ", .62, 45, .25, "d", "Reis 2006"),
+    ("cmj", "LJ", .37, 45, .25, "d", "Reis 2006"), ("fly30", "LJ", .84, 33, .50, "d", "Zhou & Kang, пик скорости разбега"),
+    ("slj", "100m", .81, 14, .50, "d", "Loturco 2015, горизонтальный прыжок"), ("slj", "100m", .82, 11, .50, "d", "Mackala 2015"), ("slj", "100m", .42, 38, .30, "d", "Almuzaini 2008"),
+    ("cmj", "100m", .85, 14, .50, "d", "Loturco 2015"), ("cmj", "100m", .80, 15, .30, "a", "по аналогии: Loturco 2015, паралимпийские спринтеры с нарушением зрения, прыжок SJ (100 м: r −.80)"), ("fly30", "100m", .90, 82, .70, "d", "Healy 2022, Vmax"),
+    ("shot_bwd", "SP", .61, 82, .30, "a", "по аналогии: бросок назад у молота (Maeda 2024)"), ("stand_put", "SP", .61, 82, .30, "a", "по аналогии: бросок назад у молота"),
+    ("stand_dt", "DT", .61, 82, .30, "a", "по аналогии: бросок назад у молота"), ("t1000", "1500m", .85, 15, .30, "a", "по аналогии: VO₂max ↔ 1500 м, R²=.72 (Bliss 2021)")]
+TEST_PRIOR = (0.30, 15.0)      # МОЁ: слабая априорная корреляция и её вес (число «наблюдений») — стягивает клетки с малым числом данных
+TEST_RHO = 0.55                # корреляция между тестами одного вида (Guthrie 2021: .56 и .64)
+R_MIN = 0.35                   # МОЁ: тест считается «связанным» с видом, если r ≥ 0,35
+TEST_LABEL = {"snatch": "Рывок", "bench": "Жим лёжа", "squat": "Присед", "triple_sj": "Тройной с места", "slj": "Прыжок с места", "cmj": "Прыжок вверх (CMJ)",
+              "shot_bwd": "Ядро назад", "stand_put": "Толчок ядра с места", "stand_dt": "Диск с места", "fly30": "Скорость (30 м с хода)", "t1000": "Бег 1000 м"}
+ROMANOV_MASS = {"100m": .02, "LJ": .03, "SP": .42, "HJ": -.04, "400m": -.01, "110mH": -.11, "DT": .36, "PV": -.06, "JT": .04, "1500m": -.12, "sum": .29}   # n=100 лучших десятиборцев мира; знак как в статье
+
+
+def test_event_pooled() -> pd.DataFrame:
+    """Клетки «тест × вид», где есть данные: Фишер-усреднение с весом (n−3)·rel и стягиванием к слабой априорной r (TEST_PRIOR)."""
+    rows = []
+    d = pd.DataFrame(LIT_TEST_R, columns=["test", "event", "r", "n", "rel", "kind", "src"])
+    for (t, e), g in d.groupby(["test", "event"], sort=False):
+        w = np.maximum(g.n.values - 3.0, 1.0) * g.rel.values
+        z = (w * np.arctanh(np.clip(g.r.values, -.99, .99))).sum()
+        z0, w0 = float(np.arctanh(TEST_PRIOR[0])), TEST_PRIOR[1]
+        rows.append(dict(test=t, event=e, r_raw=float(np.tanh(z / w.sum())), r=float(np.tanh((z + z0 * w0) / (w.sum() + w0))), w=float(w.sum()),
+                         kind=("прямая" if (g.kind == "d").any() else "по аналогии"), n_src=len(g), src="; ".join(g.src)))
+    return pd.DataFrame(rows)
+
+
+def test_event_matrix() -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Синтезированная матрица r «тест × вид» (в ориентации очков) и таблица происхождения клеток: прямая / по аналогии / через вид.
+    Пустая клетка = r теста с его лучшим «домашним» видом × связь этого вида с данным (arXiv 2026), берётся лучший путь."""
+    P = test_event_pooled()
+    Cp = lit3_corr_points()
+    tests = list(dict.fromkeys(P.test))
+    M = pd.DataFrame(np.nan, index=tests, columns=list(EVENTS))
+    K = pd.DataFrame("", index=tests, columns=list(EVENTS))
+    for r in P.itertuples():
+        M.loc[r.test, r.event], K.loc[r.test, r.event] = r.r, r.kind
+    for t in tests:
+        have = [e for e in EVENTS if not np.isnan(M.loc[t, e])]
+        for e in EVENTS:
+            if np.isnan(M.loc[t, e]):
+                h = max(have, key=lambda x: abs(M.loc[t, x] * Cp[EVENTS.index(x), EVENTS.index(e)]))
+                M.loc[t, e], K.loc[t, e] = M.loc[t, h] * Cp[EVENTS.index(h), EVENTS.index(e)], "через вид"
+    return M, K
+
+
+def test_event_sources() -> pd.DataFrame:
+    """Все исходные корреляции «тест × вид» построчно (для показа в приложении): что, где, на какой выборке, насколько я их ослабил по пригодности."""
+    d = pd.DataFrame(LIT_TEST_R, columns=["test", "event", "r", "n", "rel", "kind", "src"])
+    d["test_label"] = d.test.map(TEST_LABEL)
+    d["origin"] = d.kind.map({"d": "прямая", "a": "по аналогии"})
+    return d
+
+
+def test_sum_corr(M: Optional[pd.DataFrame] = None) -> pd.Series:
+    """r теста с суммой очков при равном разбросе очков видов: Σ r(тест, вид) / √ΣΣ R(вид, вид)  (МОЁ допущение о равном разбросе)."""
+    M = test_event_matrix()[0] if M is None else M
+    return M.sum(axis=1) / float(np.sqrt(lit3_corr_points().sum()))
+
+
+def multi_R2(r: Sequence[float], rho: float = TEST_RHO) -> float:
+    """Множественный R² вида по набору тестов с одинаковой корреляцией ρ между тестами."""
+    r = np.asarray(r, float)
+    if r.size == 0:
+        return 0.0
+    R = np.full((r.size, r.size), rho)
+    np.fill_diagonal(R, 1.0)
+    return float(np.clip(r @ np.linalg.solve(R, r), 0.0, 0.95))
+
+
 # ═════════════════════════════ 9j. «ЧТО ЕСЛИ»: профиль силы и прыжков → результаты видов и сумма очков ═════════════════════════════
 # Откуда что (это же показано в приложении).
 #  • ИЗ ИСТОЧНИКОВ: (а) Нариманов — какое значение теста соответствует какой сумме очков (таблица по уровням 4000…9000, срез по многим спортсменам: bench, triple_sj, shot_bwd, t1000);
 #    (б) Грузенкин — групповые средние тестов в двух точках (до эксперимента 7647,5 очк. и лучшие за период 7859,0), в том числе рывок и бег 30 м с хода, которых у Нариманова нет;
-#    его же отношения «результат вида / тест» (ядро назад, толчок с места, диск с места); (в) связи между видами — синтез трёх таблиц корреляций (synth_corr).
+#    его же отношения «результат вида / тест» (ядро назад, толчок с места, диск с места); (в) связи между видами и тестов с видами — синтез из литературы (раздел 9k).
 #  • МОЁ: (1) профиль «7500» (REF_PROFILE) как способ перевести «уровень» в результат вида; (2) линия Грузенкина как «значение теста → уровень» — это динамика ОДНОЙ группы за сезон,
-#    а не срез по спортсменам, поэтому вне диапазона группы (для рывка 82,6…87,6 кг) это экстраполяция; (3) веса: у теста «свой» вид — 1, у побочных видов и рывка — 0,5;
-#    (4) уровень нетестируемых видов = средний уровень протестированных + поправка по корреляциям при равном разбросе очков видов; (5) ширина коридора.
-#  • ЧЕГО НЕТ: индивидуальной регрессии «рывок → результат». У Грузенкина тесты приведены только средними по группе (6–8 человек), у Рудских в таблице силовых тестов нет, у Нариманова нет рывка и приседа.
+#    а не срез по спортсменам, поэтому вне диапазона группы (для рывка 82,6…87,6 кг) это экстраполяция; (3) стягивание оценки к уровню 7500 с коэффициентом R² (доля дисперсии вида, объяснимая тестами) —
+#    таблицы Нариманова/Грузенкина читаются «в обратную сторону», что завышает отклонение (проверено на группе Грузенкина: см. profile_validation); (4) уровень видов без теста = средний уровень
+#    протестированных + поправка по связям между видами при равном разбросе очков; (5) ширина коридора.
+#  • ЧЕГО НЕТ: индивидуальной регрессии «рывок → результат». У Грузенкина тесты приведены только средними по группе (6–8 человек), у Рудских силовых тестов нет, у Нариманова нет рывка и приседа.
 GRZ_SUM = (float(np.mean([a for a, _ in GRZ_T4["sum"]])), float(np.mean([b for _, b in GRZ_T4["sum"]])))        # 7647,5 → 7859,0 (табл. 4/5 Грузенкина)
 _REF_PTS = {e: float(wa_points(e, REF_PROFILE[e])) for e in EVENTS}
+WHATIF_L_POP = 7500.0       # центр, к которому стягиваются оценки: середина таблицы Нариманова и профиль «7500» (МОЁ; по двум точкам группы Грузенкина эмпирический коэффициент 0,42–0,46)
 PROFILE_TESTS = {
-    "snatch": dict(label="Рывок штанги, кг", short="рывок", grz="snatch_kg", scale=1.0, nar=None, ev=(("SP", .5), ("DT", .5), ("JT", .5)), step=5.0, rng=(30.0, 160.0)),
-    "bench": dict(label="Жим лёжа (1ПМ), кг", short="жим", grz="bench_kg", scale=1.0, nar="bench", ev=(("SP", .5), ("JT", .5)), step=5.0, rng=(30.0, 220.0)),
-    "triple_sj": dict(label="Тройной с места, м", short="тройной", grz="triple_cm", scale=.01, nar="triple_sj", ev=(("LJ", 1.0),), step=0.10, rng=(5.0, 11.5)),
-    "shot_bwd": dict(label="Ядро назад 7,26 кг, м", short="ядро назад", grz="bwd_cm", scale=.01, nar="shot_bwd", ev=(("SP", 1.0), ("DT", .5), ("JT", .5)), pair={"SP": "SP_bwd"},
-                     step=0.5, rng=(5.0, 22.0)),
-    "stand_put": dict(label="Толчок ядра с места, м", short="толчок с места", grz="stand_put_cm", scale=.01, nar=None, ev=(("SP", 1.0),), pair={"SP": "SP_stand"}, step=0.5, rng=(5.0, 20.0)),
-    "stand_dt": dict(label="Бросок диска с места 2 кг, м", short="диск с места", grz="stand_dt_cm", scale=.01, nar=None, ev=(("DT", 1.0),), pair={"DT": "DT_stand"}, step=2.0, rng=(15.0, 65.0)),
-    "fly30": dict(label="Бег 30 м с хода, с", short="30 м с хода", grz="fly30_s", scale=1.0, nar=None, ev=(("100m", 1.0), ("110mH", .5), ("LJ", .5)), step=-0.05, rng=(2.4, 4.5)),
-    "t1000": dict(label="Бег 1000 м, с", short="1000 м", grz=None, scale=1.0, nar="t1000", ev=(("1500m", 1.0),), step=-5.0, rng=(120.0, 400.0)),
+    "snatch": dict(label="Рывок штанги, кг", short="рывок", grz="snatch_kg", scale=1.0, nar=None, step=5.0, rng=(30.0, 160.0)),
+    "bench": dict(label="Жим лёжа (1ПМ), кг", short="жим", grz="bench_kg", scale=1.0, nar="bench", step=5.0, rng=(30.0, 220.0)),
+    "triple_sj": dict(label="Тройной с места, м", short="тройной", grz="triple_cm", scale=.01, nar="triple_sj", step=0.10, rng=(5.0, 11.5)),
+    "shot_bwd": dict(label="Ядро назад 7,26 кг, м", short="ядро назад", grz="bwd_cm", scale=.01, nar="shot_bwd", pair={"SP": "SP_bwd"}, step=0.5, rng=(5.0, 22.0)),
+    "stand_put": dict(label="Толчок ядра с места, м", short="толчок с места", grz="stand_put_cm", scale=.01, nar=None, pair={"SP": "SP_stand"}, step=0.5, rng=(5.0, 20.0)),
+    "stand_dt": dict(label="Бросок диска с места 2 кг, м", short="диск с места", grz="stand_dt_cm", scale=.01, nar=None, pair={"DT": "DT_stand"}, step=2.0, rng=(15.0, 65.0)),
+    "fly30": dict(label="Бег 30 м с хода, с", short="30 м с хода", grz="fly30_s", scale=1.0, nar=None, step=-0.05, rng=(2.4, 4.5)),
+    "t1000": dict(label="Бег 1000 м, с", short="1000 м", grz=None, scale=1.0, nar="t1000", step=-5.0, rng=(120.0, 400.0)),
 }
 LEVEL_CLIP = (5000.0, 9500.0)
 
@@ -3569,12 +3684,13 @@ def _pts_at(e: str, level: float) -> float:
     return max(_REF_PTS[e] * float(level) / 7500.0, 30.0)
 
 
-def profile_whatif(tests: Dict[str, float], current: Optional[Dict[str, float]] = None, loss: float = 295.0, sources: Sequence[str] = ("nar", "grz")) -> dict:
+def profile_whatif(tests: Dict[str, float], current: Optional[Dict[str, float]] = None, loss: float = 295.0, sources: Sequence[str] = ("nar", "grz"), shrink: bool = True) -> dict:
     """Ожидаемые результаты видов и сумма очков по введённому профилю тестов («что если»). Пустые/нулевые тесты пропускаются.
-    1) Каждый тест → уровень (профиль_levels) → уровень связанных видов (взвешенное среднее). Для ядра назад / толчка с места / диска с места — ещё и прямая функция Грузенкина
-       «результат = отношение × тест» вместо уровня (для своего вида).
-    2) Результат вида = очки профиля 7500 × уровень / 7500 (МОЁ).
-    3) Виды без теста: средний уровень по тестам + поправка по корреляциям (синтез трёх таблиц) от отклонений протестированных видов; разброс очков вида — WHATIF_SIG_E (данные Грузенкина)."""
+    1) Каждый тест → уровень (profile_levels). Вид «связан» с тестом, если синтезированная r(тест, вид) ≥ R_MIN; вес теста для вида = r².
+       Для ядра назад / толчка с места / диска с места свой вид считается ещё и прямой функцией Грузенкина «результат = отношение × тест».
+    2) Надёжность вида K = множественный R² по связанным тестам; уровень вида = 7500 + K·(взвешенный уровень − 7500) (shrink=False — без стягивания).
+    3) Результат вида = очки профиля 7500 × уровень / 7500 (МОЁ).
+    4) Виды без теста: средний уровень по тестам + поправка по связям между видами (arXiv 2026) от отклонений протестированных видов; разброс — WHATIF_SIG_E."""
     notes: List[str] = []
     clean: Dict[str, float] = {}
     for k, v in (tests or {}).items():
@@ -3585,8 +3701,10 @@ def profile_whatif(tests: Dict[str, float], current: Optional[Dict[str, float]] 
             notes.append(f"{PROFILE_TESTS[k]['label']}: значение {float(v):g} вне допустимого диапазона {lo_r:g}…{hi_r:g} — не учтено.")
             continue
         clean[k] = float(v)
+    M, _K = test_event_matrix()
+    Cp = lit3_corr_points()
     R = grz_ratios().set_index("pair")
-    est: Dict[str, List[tuple]] = {e: [] for e in EVENTS}
+    est: Dict[str, List[tuple]] = {e: [] for e in EVENTS}        # (уровень, низ, верх, r, подпись)
     trows = []
     for tk, v in clean.items():
         sp = PROFILE_TESTS[tk]
@@ -3605,51 +3723,58 @@ def profile_whatif(tests: Dict[str, float], current: Optional[Dict[str, float]] 
             out_r = []
         trows.append(dict(test=tk, label=sp["label"], value=v, nar=(lv["nar"][0] if "nar" in lv else np.nan), grz=(lv["grz"][0] if "grz" in lv else np.nan),
                           level=Lt, outside=", ".join(out_r)))
-        for e, w in sp["ev"]:
+        for e in EVENTS:
+            r_te = float(M.loc[tk, e]) if tk in M.index else 0.0
             pair = sp.get("pair", {}).get(e) if use_pair else None
             if pair:
                 r = R.loc[pair]
-                est[e].append((event_level(e, r.ratio * v), event_level(e, r.lo * v), event_level(e, r.hi * v), w, sp["short"] + " (по отношению Грузенкина)"))
-            elif lv:
-                est[e].append((Lt, lo, hi, w, sp["short"] + ("" if w >= 1.0 else " (побочный тест, вес 0,5)")))
+                est[e].append((event_level(e, r.ratio * v), event_level(e, r.lo * v), event_level(e, r.hi * v), max(r_te, R_MIN), sp["short"] + " (по отношению Грузенкина)"))
+            elif lv and r_te >= R_MIN:
+                est[e].append((Lt, lo, hi, r_te, sp["short"]))
     tested = [e for e in EVENTS if est[e]]
     empty = dict(tests=pd.DataFrame(trows, columns=["test", "label", "value", "nar", "grz", "level", "outside"]), events=pd.DataFrame(), level=float("nan"), sum_pts=0.0, sum_lo=0.0, sum_hi=0.0,
                  cur_sum_pr=None, cur_tour=None, d_vs_tour=None, notes=notes, tested=[])
     if not tested:
         return empty
-    L_e, lo_e, hi_e, W_e = {}, {}, {}, {}
+    L_e, lo_e, hi_e, K_e, r_best = {}, {}, {}, {}, {}
     for e in tested:
-        W = sum(x[3] for x in est[e])
-        W_e[e] = W
-        L_e[e] = sum(x[0] * x[3] for x in est[e]) / W
-        lo_e[e] = sum(x[1] * x[3] for x in est[e]) / W
-        hi_e[e] = sum(x[2] * x[3] for x in est[e]) / W
-    L0 = sum(L_e[e] * W_e[e] for e in tested) / sum(W_e.values())
+        w = np.array([x[3] ** 2 for x in est[e]])
+        raw = float(np.dot(w, [x[0] for x in est[e]]) / w.sum())
+        rlo = float(np.dot(w, [x[1] for x in est[e]]) / w.sum())
+        rhi = float(np.dot(w, [x[2] for x in est[e]]) / w.sum())
+        K = multi_R2([x[3] for x in est[e]]) if shrink else 1.0
+        K_e[e], r_best[e] = K, max(x[3] for x in est[e])
+        L_e[e] = WHATIF_L_POP + K * (raw - WHATIF_L_POP)
+        lo_e[e] = WHATIF_L_POP + K * (rlo - WHATIF_L_POP)
+        hi_e[e] = WHATIF_L_POP + K * (rhi - WHATIF_L_POP)
+    L0 = sum(L_e[e] * K_e[e] for e in tested) / max(sum(K_e[e] for e in tested), 1e-9)
     pts, lo_p, hi_p, basis = {}, {}, {}, {}
     for e in tested:
-        pts[e], lo_p[e], hi_p[e] = _pts_at(e, L_e[e]), _pts_at(e, lo_e[e]), _pts_at(e, hi_e[e])
+        pts[e] = _pts_at(e, L_e[e])
+        spread = max((hi_e[e] - lo_e[e]) / 2.0, 0.0)
+        h = float(np.sqrt(WHATIF_SIG_E ** 2 * (1.0 - K_e[e]) + (_REF_PTS[e] * spread / 7500.0) ** 2)) if shrink else _REF_PTS[e] * spread / 7500.0
+        lo_p[e], hi_p[e] = max(pts[e] - h, 30.0), pts[e] + h
         basis[e] = ", ".join(dict.fromkeys(x[4] for x in est[e]))
     untested = [e for e in EVENTS if e not in tested]
     if untested:
-        C = synth_corr()
         ix, iu = [EVENTS.index(e) for e in tested], [EVENTS.index(e) for e in untested]
         d = np.array([pts[e] - _pts_at(e, L0) for e in tested])
-        Ctt = C[np.ix_(ix, ix)] + 0.05 * np.eye(len(ix))
-        Cut = C[np.ix_(iu, ix)]
+        Ctt = Cp[np.ix_(ix, ix)] + 0.05 * np.eye(len(ix))
+        Cut = Cp[np.ix_(iu, ix)]
         corr = Cut @ np.linalg.solve(Ctt, d)
         R2 = np.einsum("ij,ji->i", Cut, np.linalg.solve(Ctt, Cut.T))
         for k, e in enumerate(untested):
             pts[e] = max(_pts_at(e, L0) + float(corr[k]), 30.0)
             h = float(np.sqrt(WHATIF_SIG_E ** 2 * (1.0 - min(float(R2[k]), 0.9)) + (_REF_PTS[e] * WHATIF_SIG_L / 7500.0) ** 2))
             lo_p[e], hi_p[e] = max(pts[e] - h, 30.0), pts[e] + h
-            basis[e] = "по остальным тестам + связь с видами, где тест есть" if len(tested) > 1 else "по уровню единственного теста"
+            basis[e] = "по остальным тестам + связь с видами, где тест есть" if len(tested) > 1 else "по уровню единственного вида с тестом"
     rows = []
     for e in EVENTS:
         a, b = float(wa_result(e, lo_p[e])), float(wa_result(e, hi_p[e]))
         cur = float(current[e]) if current is not None and e in current else None
         cp = float(wa_points(e, cur)) if cur is not None else None
         rows.append(dict(event=e, tested=e in tested, pts=pts[e], pts_lo=lo_p[e], pts_hi=hi_p[e], result=float(wa_result(e, pts[e])), res_lo=min(a, b), res_hi=max(a, b),
-                         current=cur, cur_pts=cp, d_pts=(pts[e] - cp if cp is not None else None), basis=basis[e]))
+                         current=cur, cur_pts=cp, d_pts=(pts[e] - cp if cp is not None else None), basis=basis[e], K=K_e.get(e), r_best=r_best.get(e)))
     ev = pd.DataFrame(rows)
     sum_pts = float(np.sum(np.floor(ev.pts)))
     dl_t = float(sum(pts[e] - lo_p[e] for e in tested)); dh_t = float(sum(hi_p[e] - pts[e] for e in tested))
@@ -3680,25 +3805,33 @@ def profile_sensitivity(tests: Dict[str, float], current: Optional[Dict[str, flo
 
 
 def corr_top_pairs(k: int = 8) -> pd.DataFrame:
-    """Самые сильные связи очков между видами (синтез таблиц 2012 / 1952–60 / эксперт) — чтобы видеть, что из чего можно (и нельзя) выводить."""
-    C = synth_corr()
-    rows = [dict(a=EVENTS[i], b=EVENTS[j], r=float(C[i, j])) for i in range(10) for j in range(i + 1, 10)]
+    """Самые сильные связи очков между видами (arXiv 2026, 1007 десятиборцев; сверка с прежним синтезом — corr_events_compare)."""
+    C = lit3_corr_points()
+    rows = [dict(a=EVENTS[i], b=EVENTS[j], r=float(C[i, j]), r_old=float(synth_corr()[i, j])) for i in range(10) for j in range(i + 1, 10)]
     return pd.DataFrame(rows).sort_values("r", key=lambda s: -s.abs()).head(k).reset_index(drop=True)
 
 
 def profile_validation() -> dict:
     """Проверка на группе Грузенкина (там известны и тесты, и результаты). Независима только таблица Нариманова: линия Грузенкина по построению проходит через сумму группы.
-    Берём тесты группы (жим, ядро назад, тройной), считаем сумму ТОЛЬКО по Нариманову и сравниваем с фактической суммой группы и очками ядра/длины."""
-    rows = []
+    Тесты группы (жим, ядро назад, тройной) → сумма ТОЛЬКО по Нариманову: без стягивания и со стягиванием; сравнение с фактической суммой группы и очками ядра/длины/диска/копья.
+    Эмпирический коэффициент стягивания k = (факт − 7500)/(оценка по тестам − 7500) по двум точкам и такой же коэффициент по литературной матрице (K_lit)."""
+    rows, kemp = [], []
+    M, _ = test_event_matrix()
     for lab, idx, S in (("до эксперимента", 0, GRZ_SUM[0]), ("лучшие за период", 3, GRZ_SUM[1])):
         t = {"bench": GRZ_T1["bench_kg"][idx], "shot_bwd": GRZ_T1["bwd_cm"][idx] / 100.0, "triple_sj": GRZ_T1["triple_cm"][idx] / 100.0}
-        r = profile_whatif(t, sources=("nar",))
-        ev = r["events"].set_index("event")
+        r0 = profile_whatif(t, sources=("nar",), shrink=False)
+        r1 = profile_whatif(t, sources=("nar",), shrink=True)
+        ev = r1["events"].set_index("event")
         k_ = 0 if idx == 0 else 1
         act = {e: float(np.mean([float(wa_points(e, a[k_])) for a in GRZ_T4[e]])) for e in ("SP", "DT", "JT")}
         act["LJ"] = float(np.mean([float(wa_points("LJ", a[k_] / 100.0)) for a in GRZ_T4["LJ_cm"]]))
-        rows.append(dict(period=lab, sum_fact=S, sum_model=r["sum_pts"], err=r["sum_pts"] - S, **{f"{e}_fact": act[e] for e in act}, **{f"{e}_model": float(ev.loc[e, "pts"]) for e in act}))
-    return dict(table=pd.DataFrame(rows), sig_level=WHATIF_SIG_L, sig_event=WHATIF_SIG_E, nar_errors=_nar_group_errors())
+        lev = float(np.mean([nar_level(nk, GRZ_T1[gk][idx] * sc) for nk, gk, sc in (("bench", "bench_kg", 1.0), ("shot_bwd", "bwd_cm", .01), ("triple_sj", "triple_cm", .01))]))
+        kemp.append((S - WHATIF_L_POP) / (lev - WHATIF_L_POP))
+        rows.append(dict(period=lab, sum_fact=S, sum_raw=r0["sum_pts"], err_raw=r0["sum_pts"] - S, sum_model=r1["sum_pts"], err=r1["sum_pts"] - S,
+                         **{f"{e}_fact": act[e] for e in act}, **{f"{e}_model": float(ev.loc[e, "pts"]) for e in act}))
+    rs = test_sum_corr(M)
+    K_lit = multi_R2([float(rs[t]) for t in ("bench", "shot_bwd", "triple_sj")])
+    return dict(table=pd.DataFrame(rows), sig_level=WHATIF_SIG_L, sig_event=WHATIF_SIG_E, nar_errors=_nar_group_errors(), k_emp=float(np.mean(kemp)), k_emp_pts=kemp, k_lit=K_lit)
 
 
 def whatif_selftest():
@@ -3706,6 +3839,26 @@ def whatif_selftest():
     # константы получены из данных, а не заданы
     assert abs(GRZ_SUM[0] - 7647.5) < 1e-9 and abs(GRZ_SUM[1] - 7859.0) < 1e-9
     assert 300 < WHATIF_SIG_L < 650 and 50 < WHATIF_SIG_E < 80, (WHATIF_SIG_L, WHATIF_SIG_E)
+    # литературная матрица связей между видами (arXiv 2026): симметрична, положительно определена, ключевые числа переписаны верно
+    C3 = lit3_corr_results()
+    assert np.allclose(C3, C3.T) and np.linalg.eigvalsh(lit3_corr_points()).min() > 0
+    assert C3[EVENTS.index("SP"), EVENTS.index("DT")] == .73 and C3[EVENTS.index("100m"), EVENTS.index("LJ")] == -.54 and C3[EVENTS.index("400m"), EVENTS.index("1500m")] == .46
+    P3 = lit3_corr_points()
+    assert P3[EVENTS.index("100m"), EVENTS.index("LJ")] == .54 and P3[EVENTS.index("100m"), EVENTS.index("400m")] == .66, "знак меняется только у пар «время–поле»"
+    # матрица «тест × вид»: клетки с данными, аналогиями и расчётом; значения в разумных границах; стягивание уменьшает |r|
+    Mx, Kx = test_event_matrix()
+    assert (Mx.abs() <= 1).all().all() and Mx.shape[1] == 10 and {"snatch", "bench", "squat", "triple_sj", "slj", "cmj", "shot_bwd", "fly30", "t1000"} <= set(Mx.index)
+    PP = test_event_pooled().set_index(["test", "event"])
+    lo_r, hi_r = np.minimum(PP.r_raw, TEST_PRIOR[0]), np.maximum(PP.r_raw, TEST_PRIOR[0])
+    assert ((PP.r >= lo_r - 1e-12) & (PP.r <= hi_r + 1e-12)).all(), "стягивание сдвигает клетку к априорной r, но не перескакивает её"
+    assert (PP.r[PP.r_raw > TEST_PRIOR[0]] < PP.r_raw[PP.r_raw > TEST_PRIOR[0]]).all(), "сильная клетка после стягивания слабее"
+    assert Kx.loc["snatch", "SP"] == "прямая" and Kx.loc["shot_bwd", "SP"] == "по аналогии" and Kx.loc["bench", "HJ"] == "через вид"
+    assert Mx.loc["fly30", "100m"] > Mx.loc["fly30", "DT"] and Mx.loc["bench", "SP"] > Mx.loc["bench", "100m"], "скорость связана со спринтом, жим — с ядром"
+    rs = test_sum_corr(Mx)
+    assert (rs > 0).all() and (rs < 1).all()
+    src_ = test_event_sources()
+    assert len(src_) == len(LIT_TEST_R) and src_.origin.notna().all() and src_.test_label.notna().all() and (src_.n >= 10).all() and src_.r.abs().le(1).all()
+    assert abs(multi_R2([.6]) - .36) < 1e-12 and multi_R2([.6, .6]) < 2 * .36 and multi_R2([.6, .6]) > .36 and multi_R2([]) == 0.0
     # линия Грузенкина проходит через оба якоря и продолжается за ними
     a, b = GRZ_T1["snatch_kg"][0], GRZ_T1["snatch_kg"][3]
     assert abs(profile_levels("snatch", a)["grz"][0] - GRZ_SUM[0]) < 1e-9 and abs(profile_levels("snatch", b)["grz"][0] - GRZ_SUM[1]) < 1e-9
@@ -3722,33 +3875,37 @@ def whatif_selftest():
     # пример пользователя: рывок 90, жим 110, тройной 9,40
     r = profile_whatif({"snatch": 90.0, "bench": 110.0, "triple_sj": 9.40}, cur)
     ev = r["events"].set_index("event")
-    assert set(r["tested"]) == {"LJ", "SP", "DT", "JT"} and len(ev) == 10
-    assert 7600 < r["sum_pts"] < 8100 and r["sum_lo"] < r["sum_pts"] < r["sum_hi"], r["sum_pts"]
+    assert {"SP", "LJ"} <= set(r["tested"]) and len(ev) == 10
+    assert 7400 < r["sum_pts"] < 8000 and r["sum_lo"] < r["sum_pts"] < r["sum_hi"], r["sum_pts"]
     assert (ev.pts_lo <= ev.pts).all() and (ev.pts <= ev.pts_hi).all() and (ev.res_lo <= ev.result + 1e-9).all() and (ev.result <= ev.res_hi + 1e-9).all()
     assert ev.loc["LJ", "tested"] and not ev.loc["HJ", "tested"]
+    # стягивание: без него оценка дальше от 7500, чем со стягиванием; надёжность K в (0, 1)
+    r_raw = profile_whatif({"snatch": 90.0, "bench": 110.0, "triple_sj": 9.40}, cur, shrink=False)
+    assert abs(r["sum_pts"] - 7500) < abs(r_raw["sum_pts"] - 7500) and (ev.K.dropna() > 0).all() and (ev.K.dropna() < 1).all()
     # монотонность: больше рывок/жим/тройной — больше сумма; меньше время — больше сумма
     base = profile_whatif({"snatch": 85.0, "bench": 105.0, "triple_sj": 9.2, "fly30": 3.1, "t1000": 175.0}, cur)["sum_pts"]
     for k, dv in (("snatch", 5.0), ("bench", 5.0), ("triple_sj", 0.1), ("fly30", -0.05), ("t1000", -5.0)):
         t = {"snatch": 85.0, "bench": 105.0, "triple_sj": 9.2, "fly30": 3.1, "t1000": 175.0}; t[k] += dv
         assert profile_whatif(t, cur)["sum_pts"] > base, k
-    # прямая функция Грузенкина: диск с места 33 → результат диска ≈ отношение × тест
+    # прямая функция Грузенкина: диск с места 33 → результат диска между «по 7500» и «по отношению Грузенкина» (стягивание)
     r2 = profile_whatif({"stand_dt": 33.0}, cur)
     lo_, mid_, hi_ = expected_from_test("DT_stand", 33.0)
-    assert abs(r2["events"].set_index("event").loc["DT", "result"] - mid_) < 0.05 and r2["tested"] == ["DT"]
-    # один вид с тестом → остальные идут по его уровню, без поправки по корреляциям
     ev2 = r2["events"].set_index("event")
-    assert abs(ev2.loc["LJ", "pts"] - _pts_at("LJ", r2["level"])) < 1e-6
-    # корреляции работают: сильный вид с тестом сдвигает коррелирующий (ядро ↔ диск 0,65) вид без теста
+    d7500 = float(wa_result("DT", _REF_PTS["DT"]))
+    assert "DT" in r2["tested"] and min(mid_, d7500) - 0.05 <= ev2.loc["DT", "result"] <= max(mid_, d7500) + 0.05, (ev2.loc["DT", "result"], mid_, d7500)
+    # корреляции работают: ядро с места высоко/низко при одинаковом тройном — диск (r=0,73 с ядром) без теста сдвигается в ту же сторону
     ra = profile_whatif({"stand_put": 15.5, "triple_sj": 8.6}, cur); rb = profile_whatif({"stand_put": 11.0, "triple_sj": 8.6}, cur)
     ea, eb = ra["events"].set_index("event"), rb["events"].set_index("event")
-    assert ea.loc["DT", "pts"] - _pts_at("DT", ra["level"]) > 0 > eb.loc["DT", "pts"] - _pts_at("DT", rb["level"]), "ядро выше уровня → диск (r=0,65) выше уровня; ядро ниже → ниже"
+    assert ea.loc["JT", "pts"] > eb.loc["JT", "pts"] and ea.loc["SP", "pts"] > eb.loc["SP", "pts"]
     # чувствительность
     s = profile_sensitivity({"snatch": 85.0, "bench": 105.0, "triple_sj": 9.2}, cur)
     assert len(s) == 3 and (s.d_sum > 0).all(), s
-    # проверка по группе Грузенкина (только Нариманов): сумма завышается, ошибки конечны и в пределах двух σ уровня
-    v = profile_validation()["table"]
-    assert (v.err.abs() < 2 * WHATIF_SIG_L).all(), v.err.tolist()
-    assert len(corr_top_pairs(5)) == 5 and corr_top_pairs(1).iloc[0].r > 0.5
+    # проверка по группе Грузенкина (только Нариманов): стягивание уменьшает ошибку по сумме; коэффициенты стягивания из данных и из литературы одного порядка
+    pv = profile_validation(); v = pv["table"]
+    assert (v.err.abs() < v.err_raw.abs()).all(), (v.err.tolist(), v.err_raw.tolist())
+    assert (v.err.abs() < 250).all(), v.err.tolist()
+    assert 0.2 < pv["k_emp"] < 0.7 and 0.1 < pv["k_lit"] < 0.7 and abs(pv["k_emp"] - pv["k_lit"]) < 0.3, (pv["k_emp"], pv["k_lit"])
+    assert len(corr_top_pairs(5)) == 5 and corr_top_pairs(1).iloc[0].r > 0.7
     # рывок из журнала: ≤ 3 повторений, вес
     lg = [dict(date="2026-10-10", items=[dict(id="st_snatch", sets=3, reps=2, size=80.0), dict(id="st_snatch", sets=1, reps=8, size=100.0)])]
     tj = tests_from_journal(lg, "2026-10-12")
@@ -5632,7 +5789,7 @@ with SEC[3]:
 with SEC[4]:
     SET = st.tabs(["👤 Профиль", "📅 Календарь и объём", "🧠 Модель", "🔧 Правила плана", "ℹ️ Как это работает", "💾 Копия данных"])
 tabs = {0: SEC[0], 1: DIA[0], 2: DIA[1], 11: DIA[2], 3: PLN[0], 12: PLN[1], 4: FC[0], 5: FC[1], 6: FC[2], 7: FC[3], 8: FC[4], 9: FC[5], 10: SET[4]}
-APP_BUILD = "12.10.2026 13:17 (Минск)"                                # подставляется сборщиком (build_single.py)
+APP_BUILD = "12.10.2026 13:56 (Минск)"                                # подставляется сборщиком (build_single.py)
 SIDE_STATUS = st.sidebar.container()                   # статус сохранения (рисуется в самом конце, когда известен итог прогона)
 
 # ───────────────────────── боковая панель: данные ─────────────────────────
@@ -6510,7 +6667,7 @@ with tabs[8]:
 with tabs[9]:
     st.subheader("Тесты СФП и потенциал")
     st.info("На этой вкладке сверху вниз: ① какие значения тестов соответствуют уровню · ② оценка ваших тестов по Нариманову · ③ функция «тест → результат вида» (Грузенкин) · "
-            "④ **«Что если»: введите рывок, жим, тройной, ядро, диск, 30 м, 1000 м — получите результаты по десяти видам и сумму очков** · ⑤ потенциал к старту (рост по Хейнла, пауза, доля плана) · "
+            "④ **«Что если»: введите рывок, жим, тройной, ядро, диск, 30 м, 1000 м — получите результаты по десяти видам и сумму очков (связи тестов с видами — из литературы, с пометкой откуда)** · ⑤ потенциал к старту (рост по Хейнла, пауза, доля плана) · "
             "⑥ ориентиры тестов на контрольные дни · ⑦ динамика тестов у группы Грузенкина.")
     st.caption("Тесты берутся из журнала сами (лучший за 120 дней) и сопоставляются с таблицей Нариманова; из профиля — только если отмечено «Тесты замерены лично». "
                "Ядро учитывается только весом 7,26 кг; Vmax = 30 м / время с хода; жим — оценка 1ПМ по формуле Эпли (вес × (1 + повторы/30)).")
@@ -6587,8 +6744,8 @@ with tabs[9]:
     WI = {}
     for i_, (k_, (lo_, hi_, stp_)) in enumerate(WF_SPEC.items()):
         WI[k_] = wcols_[i_ % 4].number_input(ds.PROFILE_TESTS[k_]["label"], lo_, hi_, 0.0, stp_, key="wf_" + k_)
-    st.caption("Присед: нормативов в доступных источниках нет (ни у Нариманова, ни у Грузенкина, ни у Рудских), поэтому в расчёте он не участвует. "
-               "Рывок есть только у Грузенкина (групповые средние 82,6 → 87,6 кг), у Нариманова его нет.")
+    st.caption("Присед, прыжок с места и прыжок вверх есть только в матрице связей ниже: уровня «какому значению соответствует сколько очков» для них в доступных источниках нет "
+               "(ни у Нариманова, ни у Грузенкина, ни у Рудских), поэтому в расчёт суммы они не входят. Рывок есть только у Грузенкина (групповые средние 82,6 → 87,6 кг), у Нариманова его нет.")
     WF = ds.profile_whatif({k_: v_ for k_, v_ in WI.items() if v_ > 0}, res, float(loss_n))
     for n_ in WF["notes"]:
         st.warning(n_)
@@ -6613,7 +6770,8 @@ with tabs[9]:
             f_ = (lambda x: fmt_t(x)) if r_.event == "1500m" else (lambda x: f"{x:.2f}")
             rows_.append({"Вид": RU[r_.event], "Основа": ("тест" if r_.tested else "связи/уровень"), "Ожидаемый результат": f_(r_.result),
                           "Коридор": f"{f_(r_.res_lo)}…{f_(r_.res_hi)}", "Очки": int(r_.pts), "Ваш ЛР": f_(r_.current), "Очки ЛР": int(r_.cur_pts),
-                          "Профиль − ЛР, очков": f"{r_.d_pts:+.0f}", "На чём основано": r_.basis})
+                          "Профиль − ЛР, очков": f"{r_.d_pts:+.0f}", "Лучшая r теста с видом": ("—" if pd.isna(r_.r_best) else f"{r_.r_best:.2f}"),
+                          "Надёжность вида (R²)": ("—" if pd.isna(r_.K) else f"{r_.K:.2f}"), "На чём основано": r_.basis})
         st.dataframe(pd.DataFrame(rows_), use_container_width=True, hide_index=True)
         evw_ = WF["events"].set_index("event")
         tt_ = evw_[evw_.tested].sort_values("d_pts", ascending=False)
@@ -6637,31 +6795,67 @@ with tabs[9]:
         st.caption("Результаты — «типичные для такого профиля», а не прогноз именно для вас: это среднее по спортсменам; ваш личный разрыв (техника, реализация, травмы) сюда не входит. "
                    "Сумма — турнирного типа (профиль 7500 в моей шкале), поэтому сравнивается с вашей суммой личных минус потери. Очки ЛР у вида обычно выше турнирных на ≈30, учитывайте это при сравнении.")
 
-    with st.expander("Как связаны виды между собой (корреляции из литературы)"):
-        cp_ = ds.corr_top_pairs(8)
-        st.dataframe(pd.DataFrame([{"Пара": f"{RU[r_.a]} – {RU[r_.b]}", "Корреляция очков": round(r_.r, 2)} for r_ in cp_.itertuples()]), use_container_width=True, hide_index=True)
-        st.caption("Синтез трёх таблиц: сильнейшие десятиборцы мира (Юшкевич, Романов, 2012), Олимпиады 1952–60 (журнал «Лёгкая атлетика») и экспертная матрица (вес малый). "
-                   "Связи слабые: заметны только ядро – диск, 100 м – барьеры – длина – 400 м. Поэтому из силовых тестов результат метаний выводится, а бег и прыжки — почти нет: "
-                   "по ним расчёт берёт общий уровень, а не «додумывает» связь. Это корреляции между спортсменами, а не прирост одного вида при росте другого у вас.")
+    with st.expander("Матрица связей «тест × вид»: что нашлось в литературе и как я это свёл"):
+        MX_, KX_ = ds.test_event_matrix()
+        RSUM_ = ds.test_sum_corr(MX_)
+        mrows_ = []
+        for t_ in MX_.index:
+            row_ = {"Тест": ds.TEST_LABEL[t_]}
+            for e_ in ds.EVENTS:
+                v_, o_ = float(MX_.loc[t_, e_]), KX_.loc[t_, e_]
+                row_[RU[e_]] = f"{v_:.2f}" if o_ == "прямая" else (f"≈{v_:.2f}" if o_ == "по аналогии" else f"({v_:.2f})")
+            row_["с суммой"] = f"{RSUM_[t_]:.2f}"
+            row_["В расчёте суммы"] = "да" if t_ in ds.PROFILE_TESTS else "только здесь"
+            mrows_.append(row_)
+        st.dataframe(pd.DataFrame(mrows_), use_container_width=True, hide_index=True)
+        st.caption("Корреляция r: «выше результат теста → лучше результат вида» (у времён знак приведён к этой ориентации). "
+                   "**0,73** — клетка опирается на найденное исследование (после усреднения нескольких работ и стягивания к слабой r = 0,30 с весом 15 наблюдений); "
+                   "**≈0,50** — по аналогии (другой снаряд или другая группа: например, бросок ядра назад ← бросок назад у молота, бег 1000 м ← VO₂max); "
+                   "**(0,38)** — моё вычисление «через вид»: r теста с его основным видом × связь этих двух видов у десятиборцев (arXiv 2026). Исследований «тест ↔ вид» "
+                   "именно у десятиборцев найти не удалось: все прямые клетки — у метателей, прыгунов, спринтеров, студентов; у них диапазон результатов шире, чем у десятиборцев, "
+                   "и r завышена (я ослабил её весом «пригодности», он мой). Колонка «с суммой» = Σ r по видам / √ΣΣ связей видов (моё допущение: одинаковый разброс очков).")
+        SRC_ = ds.test_event_sources()
+        PL_ = ds.test_event_pooled().set_index(["test", "event"])
+        st.markdown("**Исходные корреляции по строкам**")
+        st.dataframe(pd.DataFrame([{"Тест": r_.test_label, "Вид": RU[r_.event], "r в источнике": round(r_.r, 2), "Выборка, n": int(r_.n), "Пригодность (моя)": r_.rel,
+                                    "Тип": r_.origin, "Итог клетки": round(float(PL_.loc[(r_.test, r_.event), "r"]), 2), "Источник": r_.src} for r_ in SRC_.itertuples()]),
+                     use_container_width=True, hide_index=True)
+        st.caption("Не прочитано: PLOS ONE 0295083 (сервер отказал по лимиту запросов), PMC и PubMed (капча) — из них ничего не взято. В статье Maeda 2024 текст и таблица расходятся для приседа "
+                   "(.59 и .69), взята таблица. Присед → длина .906 — одна небольшая выборка студентов, значение сомнительно высокое (в итоге стянуто до ≈.65). "
+                   "Единственные данные именно о десятиборцах — Романов 2018 (100 сильнейших мира): масса тела ↔ ядро .42, диск .36, сумма .29; это не тест, показано для справки.")
+    with st.expander("Как связаны виды между собой (arXiv 2026, 1007 десятиборцев)"):
+        cp_ = ds.corr_top_pairs(10)
+        st.dataframe(pd.DataFrame([{"Пара": f"{RU[r_.a]} – {RU[r_.b]}", "Корреляция очков": round(r_.r, 2), "Прежний мой синтез": round(r_.r_old, 2)} for r_ in cp_.itertuples()]),
+                     use_container_width=True, hide_index=True)
+        st.caption(f"Таблица A7 препринта arXiv 2602.17043 (2026): {ds.LIT3_N_PERF} десятиборий {ds.LIT3_N_ATHLETES} спортсменов 2001–2022, не ниже 6400 очков. Это связи МЕЖДУ спортсменами "
+                   "(у кого сильнее ядро, у того в среднем сильнее диск), а не то, как меняется один спортсмен; разброс по уровню класса в них смешан с «профилем». Эти связи используются "
+                   "только для видов без теста и для клеток «через вид». Прежний синтез (Юшкевич–Романов, Олимпиады 1952–60, экспертная матрица) оказался слабее — он оставлен для Монте-Карло.")
     with st.expander("Проверка: как расчёт ведёт себя на группе Грузенкина"):
         PV_ = ds.profile_validation()
         tb_ = PV_["table"]
-        st.dataframe(pd.DataFrame([{"Момент": r_.period, "Сумма группы (факт)": round(r_.sum_fact), "Сумма по Нариманову (жим, ядро назад, тройной)": round(r_.sum_model),
-                                    "Ошибка": f"{r_.err:+.0f}", "Ядро: факт / модель": f"{r_.SP_fact:.0f} / {r_.SP_model:.0f}", "Длина: факт / модель": f"{r_.LJ_fact:.0f} / {r_.LJ_model:.0f}",
+        st.dataframe(pd.DataFrame([{"Момент": r_.period, "Сумма группы (факт)": round(r_.sum_fact), "Расчёт без стягивания": round(r_.sum_raw), "Ошибка без стягивания": f"{r_.err_raw:+.0f}",
+                                    "Расчёт со стягиванием": round(r_.sum_model), "Ошибка со стягиванием": f"{r_.err:+.0f}",
+                                    "Ядро: факт / модель": f"{r_.SP_fact:.0f} / {r_.SP_model:.0f}", "Длина: факт / модель": f"{r_.LJ_fact:.0f} / {r_.LJ_model:.0f}",
                                     "Диск: факт / модель": f"{r_.DT_fact:.0f} / {r_.DT_model:.0f}", "Копьё: факт / модель": f"{r_.JT_fact:.0f} / {r_.JT_model:.0f}"} for r_ in tb_.itertuples()]),
                      use_container_width=True, hide_index=True)
-        st.caption(f"Тесты группы подставлены в расчёт, как если бы это были ваши (только таблица Нариманова — линия Грузенкина по построению проходит через сумму группы и проверкой не служит). "
-                   f"Расчёт завышает: после сезона тесты группы (жим 120,8, тройной 9,60) по Нариманову «стоят» больше, чем группа набрала. Среднеквадратичная ошибка одного теста ≈ {PV_['sig_level']:.0f} очков суммы "
-                   f"— отсюда ширина коридора. Разброс очков одного вида внутри группы ≈ {PV_['sig_event']:.0f} (шесть спортсменов, четыре вида).")
+        st.caption(f"Тесты группы (жим, ядро назад, тройной) подставлены в расчёт, как если бы это были ваши; только таблица Нариманова — линия Грузенкина по построению проходит через сумму группы и проверкой не служит. "
+                   f"Без стягивания расчёт завышает отклонение от среднего (ошибки {tb_.err_raw.iloc[0]:+.0f} и {tb_.err_raw.iloc[1]:+.0f}): таблица Нариманова читается «в обратную сторону». "
+                   f"Со стягиванием к 7500 ошибки {tb_.err.iloc[0]:+.0f} и {tb_.err.iloc[1]:+.0f} — немного занижено. Коэффициент стягивания, нужный группе (по двум точкам): {PV_['k_emp']:.2f}; "
+                   f"получающийся из литературных корреляций: {PV_['k_lit']:.2f}. Они одного порядка, но не совпадают: это проверка порядка величины, а не подгонка (две точки одной группы из шести человек). "
+                   f"Среднеквадратичная ошибка одного теста по Нариманову ≈ {PV_['sig_level']:.0f} очков суммы — отсюда ширина коридора. Разброс очков одного вида внутри группы ≈ {PV_['sig_event']:.0f} "
+                   f"(шесть спортсменов, четыре вида).")
     with st.expander("Что здесь из источников, а что моё"):
         st.markdown(
             "**Из источников:** таблица Нариманова (какое значение жима, тройного, ядра назад, 1000 м соответствует какой сумме очков); Грузенкин (1990) — средние тесты группы мастеров в двух точках "
-            "(рывок, жим, ядро назад, толчок и диск с места, тройной, 30 м с хода ↔ сумма 7647,5 → 7859,0) и отношения «результат вида / тест»; корреляции между видами (три таблицы).\n\n"
-            "**Моё:** профиль «7500» как способ перевести уровень в результат вида; линия Грузенкина как «значение теста → уровень» (это динамика одной группы за сезон, не срез по спортсменам — "
-            "вне диапазона группы, для рывка 82,6…87,6 кг, это экстраполяция); вес 1 у «своего» теста и 0,5 у побочных (рывок → метания, жим → ядро и копьё, ядро назад → диск и копьё, 30 м → барьеры и длина); "
-            "перенос отклонений на виды без теста при одинаковом разбросе очков; ширина коридора.\n\n"
-            "**Чего нет:** зависимости «рывок → результат», выведенной по спортсменам. У Грузенкина тесты даны только средними по группе (6–8 человек), в таблице Рудских силовых тестов нет, "
-            "у Нариманова нет рывка и приседа. Поэтому рывок здесь — показатель общего уровня силы, а не доказанный предсказатель конкретного вида.\n\n"
+            "(рывок, жим, ядро назад, толчок и диск с места, тройной, 30 м с хода ↔ сумма 7647,5 → 7859,0) и отношения «результат вида / тест»; связи между видами — arXiv 2026 (1007 десятиборцев); "
+            "связи тестов с результатом вида — Judge & Bellar 2012 (ядро), Maeda 2024 (молот), Abd Rahim 2020, Reis 2006, Zhou & Kang (длина), Loturco 2015, Mackala 2015, Almuzaini 2008, Healy 2022 (100 м), "
+            "Guthrie 2021 (связь тестов между собой).\n\n"
+            "**Моё:** (1) профиль «7500» как способ перевести уровень в результат вида; (2) линия Грузенкина как «значение теста → уровень» (это динамика одной группы за сезон, не срез по спортсменам — "
+            "вне диапазона группы, для рывка 82,6…87,6 кг, это экстраполяция); (3) вес пригодности выборки, стягивание клеток к r = 0,30, корреляция между тестами 0,55, порог связи r ≥ 0,35; "
+            "(4) клетки «по аналогии» и «через вид»; (5) стягивание оценки вида к уровню 7500 с коэффициентом R² (доля дисперсии вида, объяснимая тестами); (6) перенос отклонений на виды без теста "
+            "при одинаковом разбросе очков; (7) ширина коридора.\n\n"
+            "**Чего нет:** исследования «рывок/жим/прыжок → результат вида» у десятиборцев и индивидуальной зависимости. У Грузенкина тесты даны только средними по группе (6–8 человек), в таблице Рудских силовых тестов нет, "
+            "у Нариманова нет рывка и приседа. Поэтому рывок здесь — показатель общего уровня силы с корреляцией, перенесённой от метателей, а не доказанный предсказатель конкретного вида.\n\n"
             "Бег 30 м с хода берётся только по Грузенкину: «Vmax» Нариманова измерен иначе (30 м / время даёт по его таблице для той же группы ≈6000–6800 вместо 7650–7860).")
 
     st.markdown("#### Потенциал к старту десятиборья")
